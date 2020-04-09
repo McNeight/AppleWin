@@ -65,12 +65,14 @@ SSC_DIPSW CSuperSerialCard::m_DIPSWDefault =
 //===========================================================================
 
 CSuperSerialCard::CSuperSerialCard() :
+	Card(CT_SSC),
+	m_uSlot(0),
 	m_aySerialPortChoices(NULL),
 	m_uTCPChoiceItemIdx(0),
-	m_uSlot(0),
-	m_bCfgSupportDCD(false)
+	m_bCfgSupportDCD(false),
+	m_pExpansionRom(NULL)
 {
-	memset(m_ayCurrentSerialPortName, 0, sizeof(m_ayCurrentSerialPortName));
+	m_ayCurrentSerialPortName.clear();
 	m_dwSerialPortItem = 0;
 
 	m_hCommHandle = INVALID_HANDLE_VALUE;
@@ -181,7 +183,11 @@ void CSuperSerialCard::UpdateCommState()
 	dcb.ByteSize = m_uByteSize;
 	dcb.Parity   = m_uParity;
 	dcb.StopBits = m_uStopBits;
+
+	// Specifies the DTR (data-terminal-ready) input flow control (use dcb.fOutxCtsFlow for output)
 	dcb.fDtrControl = m_uDTR;	// GH#386
+
+	// Specifies the RTS (request-to-send) input flow control (use dcb.fOutxDsrFlow for output)
 	dcb.fRtsControl = m_uRTS;	// GH#311
 
 	SetCommState(m_hCommHandle,&dcb);
@@ -252,7 +258,7 @@ bool CSuperSerialCard::CheckComm()
 	{
 		_ASSERT(m_dwSerialPortItem < m_vecSerialPortsItems.size()-1);	// size()-1 is TCP item
 		TCHAR portname[SIZEOF_SERIALCHOICE_ITEM];
-		wsprintf(portname, TEXT("COM%u"), m_vecSerialPortsItems[m_dwSerialPortItem]);
+		wsprintf(portname, TEXT("\\\\.\\COM%u"), m_vecSerialPortsItems[m_dwSerialPortItem]);
 
 		m_hCommHandle = CreateFile(portname,
 								GENERIC_READ | GENERIC_WRITE,
@@ -264,6 +270,8 @@ bool CSuperSerialCard::CheckComm()
 
 		if (m_hCommHandle != INVALID_HANDLE_VALUE)
 		{
+			GetCommModemStatus(m_hCommHandle, const_cast<DWORD*>(&m_dwModemStatus));
+
 			//BOOL bRes = SetupComm(m_hCommHandle, 8192, 8192);
 			//_ASSERT(bRes);
 
@@ -685,7 +693,21 @@ BYTE __stdcall CSuperSerialCard::CommReceive(WORD, WORD, BYTE, BYTE, ULONG)
 
 void CSuperSerialCard::TransmitDone(void)
 {
-	m_vbTxEmpty = true;	// Transmit done
+	if (m_hCommHandle != INVALID_HANDLE_VALUE)
+	{
+		// Use CriticalSection to ensure that write to m_vbTxEmpty is atomic w.r.t CommTransmit() (GH#707)
+		EnterCriticalSection(&m_CriticalSection);
+
+		_ASSERT(m_vbTxEmpty == false);
+		m_vbTxEmpty = true;	// Transmit done (COM)
+
+		LeaveCriticalSection(&m_CriticalSection);
+	}
+	else
+	{
+		_ASSERT(m_vbTxEmpty == false);
+		m_vbTxEmpty = true;	// Transmit done (TCP)
+	}
 
 	if (m_bTxIrqEnabled)	// GH#522
 	{
@@ -711,6 +733,7 @@ BYTE __stdcall CSuperSerialCard::CommTransmit(WORD, WORD, BYTE, BYTE value, ULON
 			data &= ~(1 << m_uByteSize);
 		}
 		int sent = send(m_hCommAcceptSocket, (const char*)&data, 1, 0);
+		_ASSERT(sent == 1);
 		if (sent == 1)
 		{
 			m_vbTxEmpty = false;
@@ -720,10 +743,30 @@ BYTE __stdcall CSuperSerialCard::CommTransmit(WORD, WORD, BYTE, BYTE value, ULON
 	}
 	else if (m_hCommHandle != INVALID_HANDLE_VALUE)
 	{
+		BOOL res = false;
+		DWORD error = 0;
+
+		// Use CriticalSection to keep WriteFile() & m_vbTxEmpty in sync (GH#707)
+		EnterCriticalSection(&m_CriticalSection);
+
+		_ASSERT(m_vbTxEmpty == true);
 		DWORD uBytesWritten;
-		WriteFile(m_hCommHandle, &value, 1, &uBytesWritten, &m_o);
-		m_vbTxEmpty = false;
-		// NB. Now CommThread() determines when transmit buffer is empty and calls TransmitDone()
+		res = WriteFile(m_hCommHandle, &value, 1, &uBytesWritten, &m_o);
+		_ASSERT(res);
+		if (res)
+		{
+			m_vbTxEmpty = false;
+			// NB. Now CommThread() determines when transmit buffer is empty and calls TransmitDone()
+		}
+		else
+		{
+			error = GetLastError();
+		}
+
+		LeaveCriticalSection(&m_CriticalSection);
+
+		if (!res)
+			LogFileOutput("SSC: CommTransmit(): WriteFile() failed: 0x%08X\n", error);
 	}
 
 	return 0;
@@ -966,11 +1009,14 @@ void CSuperSerialCard::CommSetSerialPort(HWND hWindow, DWORD dwNewSerialPortItem
 	m_dwSerialPortItem = dwNewSerialPortItem;
 
 	if (m_dwSerialPortItem == m_uTCPChoiceItemIdx)
-		strcpy(m_ayCurrentSerialPortName, TEXT_SERIAL_TCP);
-	else if (m_dwSerialPortItem != 0)
-		sprintf(m_ayCurrentSerialPortName, TEXT_SERIAL_COM"%d", m_vecSerialPortsItems[m_dwSerialPortItem]);
+		m_ayCurrentSerialPortName = TEXT_SERIAL_TCP;
+	else if (m_dwSerialPortItem != 0) {
+		TCHAR temp[SIZEOF_SERIALCHOICE_ITEM];
+		sprintf(temp, TEXT_SERIAL_COM"%d", m_vecSerialPortsItems[m_dwSerialPortItem]);
+		m_ayCurrentSerialPortName = temp;
+	}
 	else
-		m_ayCurrentSerialPortName[0] = 0;	// "None"
+		m_ayCurrentSerialPortName.clear();	// "None"
 }
 
 //===========================================================================
@@ -994,8 +1040,6 @@ void CSuperSerialCard::CommSetSerialPort(HWND hWindow, DWORD dwNewSerialPortItem
 // . COMSTAT::InQueue = 0x1000
 //
 
-static UINT g_uDbgTotalCOMRx = 0;
-
 void CSuperSerialCard::CheckCommEvent(DWORD dwEvtMask)
 {
 	if (dwEvtMask & EV_RXCHAR)
@@ -1010,8 +1054,6 @@ void CSuperSerialCard::CheckCommEvent(DWORD dwEvtMask)
 		{
 			if (!ReadFile(m_hCommHandle, Data, sizeof(Data), &dwReceived, &m_o) || !dwReceived)
 				break;
-
-			g_uDbgTotalCOMRx += dwReceived;
 
 			bGotData = true;
 
@@ -1082,9 +1124,7 @@ DWORD WINAPI CSuperSerialCard::CommThread(LPVOID lpParameter)
 	//
 
 	const UINT nNumEvents = 2;
-
 	HANDLE hCommEvent_Wait[nNumEvents] = {pSSC->m_hCommEvent[COMMEVT_WAIT], pSSC->m_hCommEvent[COMMEVT_TERM]};
-	HANDLE hCommEvent_Ack[nNumEvents]  = {pSSC->m_hCommEvent[COMMEVT_ACK],  pSSC->m_hCommEvent[COMMEVT_TERM]};
 
 	while(1)
 	{
@@ -1092,7 +1132,6 @@ DWORD WINAPI CSuperSerialCard::CommThread(LPVOID lpParameter)
 		DWORD dwWaitResult;
 
 		bRes = WaitCommEvent(pSSC->m_hCommHandle, &dwEvtMask, &pSSC->m_o);	// Will return immediately (probably with ERROR_IO_PENDING)
-		_ASSERT(!bRes);
 		if (!bRes)
 		{
 			DWORD dwRet = GetLastError();
@@ -1255,7 +1294,7 @@ void CSuperSerialCard::ScanCOMPorts()
 	for (UINT i=1; i<32; i++)	// Arbitrary upper limit
 	{
 		TCHAR portname[SIZEOF_SERIALCHOICE_ITEM];
-		wsprintf(portname, TEXT("COM%u"), i);
+		wsprintf(portname, TEXT("\\\\.\\COM%u"), i);
 
 		HANDLE hCommHandle = CreateFile(portname,
 								GENERIC_READ | GENERIC_WRITE,
@@ -1315,7 +1354,7 @@ char* CSuperSerialCard::GetSerialPortChoices()
 // Called by LoadConfiguration()
 void CSuperSerialCard::SetSerialPortName(const char* pSerialPortName)
 {
-	strncpy(m_ayCurrentSerialPortName, pSerialPortName, SIZEOF_SERIALCHOICE_ITEM);
+	m_ayCurrentSerialPortName = pSerialPortName;
 
 	// Init m_aySerialPortChoices, so that we have choices to show if serial is active when we 1st open Config dialog
 	GetSerialPortChoices();
@@ -1347,28 +1386,9 @@ void CSuperSerialCard::SetSerialPortName(const char* pSerialPortName)
 	}
 	else
 	{
-		m_ayCurrentSerialPortName[0] = 0;	// "None"
+		m_ayCurrentSerialPortName.clear();	// "None"
 		m_dwSerialPortItem = 0;
 	}
-}
-
-//===========================================================================
-
-void CSuperSerialCard::SetSnapshot_v1(	const DWORD  baudrate,
-										const BYTE   bytesize,
-										const BYTE   commandbyte,
-										const DWORD  comminactivity,
-										const BYTE   controlbyte,
-										const BYTE   parity,
-										const BYTE   stopbits)
-{
-	// Redundant:
-	// . baudrate, stopbits, bytesize (encapsulated in controlbyte)
-	// . parity (encapsulated in commandbyte)
-	// Obsolete:
-	// . comminactivity
-
-	UpdateCommandAndControlRegs(commandbyte, controlbyte);
 }
 
 //===========================================================================
@@ -1486,6 +1506,9 @@ bool CSuperSerialCard::LoadSnapshot(YamlLoadHelper& yamlLoadHelper, UINT slot, U
 	m_vbTxIrqPending	= yamlLoadHelper.LoadBool(SS_YAML_KEY_TXIRQPENDING);
 	m_vbRxIrqPending	= yamlLoadHelper.LoadBool(SS_YAML_KEY_RXIRQPENDING);
 	m_vbTxEmpty			= yamlLoadHelper.LoadBool(SS_YAML_KEY_WRITTENTX);
+
+	if (m_vbTxIrqPending || m_vbRxIrqPending)	// GH#677
+		CpuIrqAssert(IS_SSC);
 
 	std::string serialPortName = yamlLoadHelper.LoadString(SS_YAML_KEY_SERIALPORTNAME);
 	SetSerialPortName(serialPortName.c_str());

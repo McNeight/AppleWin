@@ -34,11 +34,32 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #include "minizip/unzip.h"
 
 #include "CPU.h"
-#include "Disk.h"
 #include "DiskImage.h"
 #include "DiskImageHelper.h"
+#include "Log.h"
 #include "Memory.h"
 
+ImageInfo::ImageInfo()
+{
+	// this is not a POD as it contains c++ strings
+	// simply zeroing is not going to work
+	pImageType = NULL;
+	pImageHelper = NULL;
+	FileType = eFileNormal;
+	hFile = INVALID_HANDLE_VALUE;
+	uOffset = 0;
+	bWriteProtected = false;
+	uImageSize = 0;
+	ZeroMemory(&zipFileInfo, sizeof(zipFileInfo));
+	uNumEntriesInZip = 0;
+	uNumValidImagesInZip = 0;
+	uNumTracks = 0;
+	pImageBuffer = NULL;
+	pWOZTrackMap = NULL;
+	optimalBitTiming = 0;
+	bootSectorFormat = CWOZHelper::bootUnknown;
+	maxNibblesPerTrack = 0;
+}
 
 /* DO logical order  0 1 2 3 4 5 6 7 8 9 A B C D E F */
 /*    physical order 0 D B 9 7 5 3 1 E C A 8 6 4 2 F */
@@ -69,10 +90,17 @@ LPBYTE CImageBase::ms_pWorkBuffer = NULL;
 
 //-----------------------------------------------------------------------------
 
+bool CImageBase::WriteImageHeader(ImageInfo* pImageInfo, LPBYTE pHdr, const UINT hdrSize)
+{
+	return WriteImageData(pImageInfo, pHdr, hdrSize, 0);
+}
+
+//-----------------------------------------------------------------------------
+
 bool CImageBase::ReadTrack(ImageInfo* pImageInfo, const int nTrack, LPBYTE pTrackBuffer, const UINT uTrackSize)
 {
-	const long Offset = pImageInfo->uOffset + nTrack * uTrackSize;
-	memcpy(pTrackBuffer, &pImageInfo->pImageBuffer[Offset], uTrackSize);
+	const long offset = pImageInfo->uOffset + nTrack * uTrackSize;
+	memcpy(pTrackBuffer, &pImageInfo->pImageBuffer[offset], uTrackSize);
 
 	return true;
 }
@@ -81,69 +109,10 @@ bool CImageBase::ReadTrack(ImageInfo* pImageInfo, const int nTrack, LPBYTE pTrac
 
 bool CImageBase::WriteTrack(ImageInfo* pImageInfo, const int nTrack, LPBYTE pTrackBuffer, const UINT uTrackSize)
 {
-	const long Offset = pImageInfo->uOffset + nTrack * uTrackSize;
-	memcpy(&pImageInfo->pImageBuffer[Offset], pTrackBuffer, uTrackSize);
+	const long offset = pImageInfo->uOffset + nTrack * uTrackSize;
+	memcpy(&pImageInfo->pImageBuffer[offset], pTrackBuffer, uTrackSize);
 
-	if (pImageInfo->FileType == eFileNormal)
-	{
-		if (pImageInfo->hFile == INVALID_HANDLE_VALUE)
-			return false;
-
-		SetFilePointer(pImageInfo->hFile, Offset, NULL, FILE_BEGIN);
-
-		DWORD dwBytesWritten;
-		BOOL bRes = WriteFile(pImageInfo->hFile, pTrackBuffer, uTrackSize, &dwBytesWritten, NULL);
-		_ASSERT(dwBytesWritten == uTrackSize);
-		if (!bRes || dwBytesWritten != uTrackSize)
-			return false;
-	}
-	else if (pImageInfo->FileType == eFileGZip)
-	{
-		// Write entire compressed image each time (dirty track change or dirty disk removal)
-		gzFile hGZFile = gzopen(pImageInfo->szFilename, "wb");
-		if (hGZFile == NULL)
-			return false;
-
-		int nLen = gzwrite(hGZFile, pImageInfo->pImageBuffer, pImageInfo->uImageSize);
-		if (nLen != pImageInfo->uImageSize)
-			return false;
-
-		int nRes = gzclose(hGZFile);
-		hGZFile = NULL;
-		if (nRes != Z_OK)
-			return false;
-	}
-	else if (pImageInfo->FileType == eFileZip)
-	{
-		// Write entire compressed image each time (dirty track change or dirty disk removal)
-		// NB. Only support Zip archives with a single file
-		zipFile hZipFile = zipOpen(pImageInfo->szFilename, APPEND_STATUS_CREATE);
-		if (hZipFile == NULL)
-			return false;
-
-		int nRes = zipOpenNewFileInZip(hZipFile, pImageInfo->szFilenameInZip, &pImageInfo->zipFileInfo, NULL, 0, NULL, 0, NULL, Z_DEFLATED, Z_BEST_SPEED);
-		if (nRes != ZIP_OK)
-			return false;
-
-		nRes = zipWriteInFileInZip(hZipFile, pImageInfo->pImageBuffer, pImageInfo->uImageSize);
-		if (nRes != ZIP_OK)
-			return false;
-
-		nRes = zipCloseFileInZip(hZipFile);
-		if (nRes != ZIP_OK)
-			return false;
-
-		nRes = zipClose(hZipFile, NULL);
-		if (nRes != ZIP_OK)
-			return false;
-	}
-	else
-	{
-		_ASSERT(0);
-		return false;
-	}
-
-	return true;
+	return WriteImageData(pImageInfo, pTrackBuffer, uTrackSize, offset);
 }
 
 //-----------------------------------------------------------------------------
@@ -181,15 +150,15 @@ bool CImageBase::ReadBlock(ImageInfo* pImageInfo, const int nBlock, LPBYTE pBloc
 
 bool CImageBase::WriteBlock(ImageInfo* pImageInfo, const int nBlock, LPBYTE pBlockBuffer)
 {
-	long Offset = pImageInfo->uOffset + nBlock * HD_BLOCK_SIZE;
-	const bool bGrowImageBuffer = (UINT)Offset+HD_BLOCK_SIZE > pImageInfo->uImageSize;
+	long offset = pImageInfo->uOffset + nBlock * HD_BLOCK_SIZE;
+	const bool bGrowImageBuffer = (UINT)offset+HD_BLOCK_SIZE > pImageInfo->uImageSize;
 
 	if (pImageInfo->FileType == eFileGZip || pImageInfo->FileType == eFileZip)
 	{
 		if (bGrowImageBuffer)
 		{
 			// Horribly inefficient! (Unzip to a normal file if you want better performance!)
-			const UINT uNewImageSize = Offset+HD_BLOCK_SIZE;
+			const UINT uNewImageSize = offset+HD_BLOCK_SIZE;
 			BYTE* pNewImageBuffer = new BYTE [uNewImageSize];
 
 			memcpy(pNewImageBuffer, pImageInfo->pImageBuffer, pImageInfo->uImageSize);
@@ -200,61 +169,103 @@ bool CImageBase::WriteBlock(ImageInfo* pImageInfo, const int nBlock, LPBYTE pBlo
 			pImageInfo->uImageSize = uNewImageSize;
 		}
 
-		memcpy(&pImageInfo->pImageBuffer[Offset], pBlockBuffer, HD_BLOCK_SIZE);
+		memcpy(&pImageInfo->pImageBuffer[offset], pBlockBuffer, HD_BLOCK_SIZE);
 	}
 
+	if (!WriteImageData(pImageInfo, pBlockBuffer, HD_BLOCK_SIZE, offset))
+	{
+		_ASSERT(0);
+		return false;
+	}
+
+	if (pImageInfo->FileType == eFileNormal)
+	{
+		if (bGrowImageBuffer)
+			pImageInfo->uImageSize += HD_BLOCK_SIZE;
+	}
+
+	return true;
+}
+
+//-----------------------------------------------------------------------------
+
+bool CImageBase::WriteImageData(ImageInfo* pImageInfo, LPBYTE pSrcBuffer, const UINT uSrcSize, const long offset)
+{
 	if (pImageInfo->FileType == eFileNormal)
 	{
 		if (pImageInfo->hFile == INVALID_HANDLE_VALUE)
 			return false;
 
-		SetFilePointer(pImageInfo->hFile, Offset, NULL, FILE_BEGIN);
+		if (SetFilePointer(pImageInfo->hFile, offset, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER)
+		{
+			DWORD err = GetLastError();
+			return false;
+		}
 
 		DWORD dwBytesWritten;
-		BOOL bRes = WriteFile(pImageInfo->hFile, pBlockBuffer, HD_BLOCK_SIZE, &dwBytesWritten, NULL);
-		if (!bRes || dwBytesWritten != HD_BLOCK_SIZE)
+		BOOL bRes = WriteFile(pImageInfo->hFile, pSrcBuffer, uSrcSize, &dwBytesWritten, NULL);
+		_ASSERT(dwBytesWritten == uSrcSize);
+		if (!bRes || dwBytesWritten != uSrcSize)
 			return false;
-
-		if (bGrowImageBuffer)
-			pImageInfo->uImageSize += HD_BLOCK_SIZE;
 	}
 	else if (pImageInfo->FileType == eFileGZip)
 	{
-		// Write entire compressed image each time a block is written
-		gzFile hGZFile = gzopen(pImageInfo->szFilename, "wb");
+		// Write entire compressed image each time (dirty track change or dirty disk removal or a HDD block is written)
+		gzFile hGZFile = gzopen(pImageInfo->szFilename.c_str(), "wb");
 		if (hGZFile == NULL)
 			return false;
 
 		int nLen = gzwrite(hGZFile, pImageInfo->pImageBuffer, pImageInfo->uImageSize);
+		int nRes = gzclose(hGZFile);	// close before returning (due to error) to avoid resource leak
+		hGZFile = NULL;
+
 		if (nLen != pImageInfo->uImageSize)
 			return false;
 
-		int nRes = gzclose(hGZFile);
-		hGZFile = NULL;
 		if (nRes != Z_OK)
 			return false;
 	}
 	else if (pImageInfo->FileType == eFileZip)
 	{
-		// Write entire compressed image each time a block is written
+		// Write entire compressed image each time (dirty track change or dirty disk removal or a HDD block is written)
 		// NB. Only support Zip archives with a single file
-		zipFile hZipFile = zipOpen(pImageInfo->szFilename, APPEND_STATUS_CREATE);
+		// - there is no delete in a zipfile, so would need to copy files from old to new zip file!
+		_ASSERT(pImageInfo->uNumEntriesInZip == 1);	// Should never occur, since image will be write-protected in CheckZipFile()
+		if (pImageInfo->uNumEntriesInZip > 1)
+			return false;
+
+		zipFile hZipFile = zipOpen(pImageInfo->szFilename.c_str(), APPEND_STATUS_CREATE);
 		if (hZipFile == NULL)
 			return false;
 
-		int nRes = zipOpenNewFileInZip(hZipFile, pImageInfo->szFilenameInZip, &pImageInfo->zipFileInfo, NULL, 0, NULL, 0, NULL, Z_DEFLATED, Z_BEST_SPEED);
-		if (nRes != ZIP_OK)
-			return false;
+		int nOpenedFileInZip = ZIP_BADZIPFILE;
 
-		nRes = zipWriteInFileInZip(hZipFile, pImageInfo->pImageBuffer, pImageInfo->uImageSize);
-		if (nRes != ZIP_OK)
-			return false;
+		try
+		{
+			nOpenedFileInZip = zipOpenNewFileInZip(hZipFile, pImageInfo->szFilenameInZip.c_str(), &pImageInfo->zipFileInfo, NULL, 0, NULL, 0, NULL, Z_DEFLATED, Z_BEST_SPEED);
+			if (nOpenedFileInZip != ZIP_OK)
+				throw false;
 
-		nRes = zipCloseFileInZip(hZipFile);
-		if (nRes != ZIP_OK)
-			return false;
+			int nRes = zipWriteInFileInZip(hZipFile, pImageInfo->pImageBuffer, pImageInfo->uImageSize);
+			if (nRes != ZIP_OK)
+				throw false;
 
-		nRes = zipClose(hZipFile, NULL);
+			nOpenedFileInZip = ZIP_BADZIPFILE;
+			nRes = zipCloseFileInZip(hZipFile);
+			if (nRes != ZIP_OK)
+				throw false;
+		}
+		catch (bool)
+		{
+			if (nOpenedFileInZip == ZIP_OK)
+				zipCloseFileInZip(hZipFile);
+
+			zipClose(hZipFile, NULL);
+
+			return false;
+		}
+
+		int nRes = zipClose(hZipFile, NULL);
 		if (nRes != ZIP_OK)
 			return false;
 	}
@@ -631,22 +642,24 @@ public:
 		return ePossibleMatch;
 	}
 
-	virtual void Read(ImageInfo* pImageInfo, int nTrack, int nQuarterTrack, LPBYTE pTrackImageBuffer, int* pNibbles)
+	virtual void Read(ImageInfo* pImageInfo, const float phase, LPBYTE pTrackImageBuffer, int* pNibbles, UINT* pBitCount, bool enhanceDisk)
 	{
-		ReadTrack(pImageInfo, nTrack, ms_pWorkBuffer, TRACK_DENIBBLIZED_SIZE);
-		*pNibbles = NibblizeTrack(pTrackImageBuffer, eDOSOrder, nTrack);
-		if (!Disk_GetEnhanceDisk())
-			SkewTrack(nTrack, *pNibbles, pTrackImageBuffer);
+		const UINT track = PhaseToTrack(phase);
+		ReadTrack(pImageInfo, track, ms_pWorkBuffer, TRACK_DENIBBLIZED_SIZE);
+		*pNibbles = NibblizeTrack(pTrackImageBuffer, eDOSOrder, track);
+		if (!enhanceDisk)
+			SkewTrack(track, *pNibbles, pTrackImageBuffer);
 	}
 
-	virtual void Write(ImageInfo* pImageInfo, int nTrack, int nQuarterTrack, LPBYTE pTrackImage, int nNibbles)
+	virtual void Write(ImageInfo* pImageInfo, const float phase, LPBYTE pTrackImageBuffer, int nNibbles)
 	{
-		DenibblizeTrack(pTrackImage, eDOSOrder, nNibbles);
-		WriteTrack(pImageInfo, nTrack, ms_pWorkBuffer, TRACK_DENIBBLIZED_SIZE);
+		const UINT track = PhaseToTrack(phase);
+		DenibblizeTrack(pTrackImageBuffer, eDOSOrder, nNibbles);
+		WriteTrack(pImageInfo, track, ms_pWorkBuffer, TRACK_DENIBBLIZED_SIZE);
 	}
 
 	virtual bool AllowCreate(void) { return true; }
-	virtual UINT GetImageSizeForCreate(void) { return TRACK_DENIBBLIZED_SIZE * TRACKS_STANDARD; }
+	virtual UINT GetImageSizeForCreate(void) { m_uNumTracksInImage = TRACKS_STANDARD; return TRACK_DENIBBLIZED_SIZE * TRACKS_STANDARD; }
 
 	virtual eImageType GetType(void) { return eImageDO; }
 	virtual const char* GetCreateExtensions(void) { return ".do;.dsk"; }
@@ -697,23 +710,25 @@ public:
 		return ePossibleMatch;
 	}
 
-	virtual void Read(ImageInfo* pImageInfo, int nTrack, int nQuarterTrack, LPBYTE pTrackImageBuffer, int* pNibbles)
+	virtual void Read(ImageInfo* pImageInfo, const float phase, LPBYTE pTrackImageBuffer, int* pNibbles, UINT* pBitCount, bool enhanceDisk)
 	{
-		ReadTrack(pImageInfo, nTrack, ms_pWorkBuffer, TRACK_DENIBBLIZED_SIZE);
-		*pNibbles = NibblizeTrack(pTrackImageBuffer, eProDOSOrder, nTrack);
-		if (!Disk_GetEnhanceDisk())
-			SkewTrack(nTrack, *pNibbles, pTrackImageBuffer);
+		const UINT track = PhaseToTrack(phase);
+		ReadTrack(pImageInfo, track, ms_pWorkBuffer, TRACK_DENIBBLIZED_SIZE);
+		*pNibbles = NibblizeTrack(pTrackImageBuffer, eProDOSOrder, track);
+		if (!enhanceDisk)
+			SkewTrack(track, *pNibbles, pTrackImageBuffer);
 	}
 
-	virtual void Write(ImageInfo* pImageInfo, int nTrack, int nQuarterTrack, LPBYTE pTrackImage, int nNibbles)
+	virtual void Write(ImageInfo* pImageInfo, const float phase, LPBYTE pTrackImageBuffer, int nNibbles)
 	{
-		DenibblizeTrack(pTrackImage, eProDOSOrder, nNibbles);
-		WriteTrack(pImageInfo, nTrack, ms_pWorkBuffer, TRACK_DENIBBLIZED_SIZE);
+		const UINT track = PhaseToTrack(phase);
+		DenibblizeTrack(pTrackImageBuffer, eProDOSOrder, nNibbles);
+		WriteTrack(pImageInfo, track, ms_pWorkBuffer, TRACK_DENIBBLIZED_SIZE);
 	}
 
 	virtual eImageType GetType(void) { return eImagePO; }
 	virtual const char* GetCreateExtensions(void) { return ".po"; }
-	virtual const char* GetRejectExtensions(void) { return ".do;.iie;.nib;.prg"; }
+	virtual const char* GetRejectExtensions(void) { return ".do;.iie;.nib;.prg;.woz"; }
 };
 
 //-------------------------------------
@@ -725,7 +740,7 @@ public:
 	CNib1Image(void) {}
 	virtual ~CNib1Image(void) {}
 
-	static const UINT NIB1_TRACK_SIZE = NIBBLES_PER_TRACK;
+	static const UINT NIB1_TRACK_SIZE = NIBBLES_PER_TRACK_NIB;
 
 	virtual eDetectResult Detect(const LPBYTE pImage, const DWORD dwImageSize, const TCHAR* pszExt)
 	{
@@ -736,24 +751,26 @@ public:
 		return eMatch;
 	}
 
-	virtual void Read(ImageInfo* pImageInfo, int nTrack, int nQuarterTrack, LPBYTE pTrackImageBuffer, int* pNibbles)
+	virtual void Read(ImageInfo* pImageInfo, const float phase, LPBYTE pTrackImageBuffer, int* pNibbles, UINT* pBitCount, bool enhanceDisk)
 	{
-		ReadTrack(pImageInfo, nTrack, pTrackImageBuffer, NIB1_TRACK_SIZE);
+		const UINT track = PhaseToTrack(phase);
+		ReadTrack(pImageInfo, track, pTrackImageBuffer, NIB1_TRACK_SIZE);
 		*pNibbles = NIB1_TRACK_SIZE;
 	}
 
-	virtual void Write(ImageInfo* pImageInfo, int nTrack, int nQuarterTrack, LPBYTE pTrackImage, int nNibbles)
+	virtual void Write(ImageInfo* pImageInfo, const float phase, LPBYTE pTrackImageBuffer, int nNibbles)
 	{
 		_ASSERT(nNibbles == NIB1_TRACK_SIZE);	// Must be true - as nNibbles gets init'd by ImageReadTrace()
-		WriteTrack(pImageInfo, nTrack, pTrackImage, nNibbles);
+		const UINT track = PhaseToTrack(phase);
+		WriteTrack(pImageInfo, track, pTrackImageBuffer, nNibbles);
 	}
 
 	virtual bool AllowCreate(void) { return true; }
-	virtual UINT GetImageSizeForCreate(void) { return NIB1_TRACK_SIZE * TRACKS_STANDARD; }
+	virtual UINT GetImageSizeForCreate(void) { m_uNumTracksInImage = TRACKS_STANDARD; return NIB1_TRACK_SIZE * TRACKS_STANDARD; }
 
 	virtual eImageType GetType(void) { return eImageNIB1; }
 	virtual const char* GetCreateExtensions(void) { return ".nib"; }
-	virtual const char* GetRejectExtensions(void) { return ".do;.iie;.po;.prg"; }
+	virtual const char* GetRejectExtensions(void) { return ".do;.iie;.po;.prg;.woz"; }
 };
 
 //-------------------------------------
@@ -776,21 +793,23 @@ public:
 		return eMatch;
 	}
 
-	virtual void Read(ImageInfo* pImageInfo, int nTrack, int nQuarterTrack, LPBYTE pTrackImageBuffer, int* pNibbles)
+	virtual void Read(ImageInfo* pImageInfo, const float phase, LPBYTE pTrackImageBuffer, int* pNibbles, UINT* pBitCount, bool enhanceDisk)
 	{
-		ReadTrack(pImageInfo, nTrack, pTrackImageBuffer, NIB2_TRACK_SIZE);
+		const UINT track = PhaseToTrack(phase);
+		ReadTrack(pImageInfo, track, pTrackImageBuffer, NIB2_TRACK_SIZE);
 		*pNibbles = NIB2_TRACK_SIZE;
 	}
 
-	virtual void Write(ImageInfo* pImageInfo, int nTrack, int nQuarterTrack, LPBYTE pTrackImage, int nNibbles)
+	virtual void Write(ImageInfo* pImageInfo, const float phase, LPBYTE pTrackImageBuffer, int nNibbles)
 	{
 		_ASSERT(nNibbles == NIB2_TRACK_SIZE);	// Must be true - as nNibbles gets init'd by ImageReadTrace()
-		WriteTrack(pImageInfo, nTrack, pTrackImage, nNibbles);
+		const UINT track = PhaseToTrack(phase);
+		WriteTrack(pImageInfo, track, pTrackImageBuffer, nNibbles);
 	}
 
 	virtual eImageType GetType(void) { return eImageNIB2; }
 	virtual const char* GetCreateExtensions(void) { return ".nb2"; }
-	virtual const char* GetRejectExtensions(void) { return ".do;.iie;.po;.prg;.2mg;.2img"; }
+	virtual const char* GetRejectExtensions(void) { return ".do;.iie;.po;.prg;.woz;.2mg;.2img"; }
 };
 
 //-------------------------------------
@@ -852,8 +871,10 @@ public:
 		return eMatch;
 	}
 
-	virtual void Read(ImageInfo* pImageInfo, int nTrack, int nQuarterTrack, LPBYTE pTrackImageBuffer, int* pNibbles)
+	virtual void Read(ImageInfo* pImageInfo, const float phase, LPBYTE pTrackImageBuffer, int* pNibbles, UINT* pBitCount, bool enhanceDisk)
 	{
+		UINT track = PhaseToTrack(phase);
+
 		// IF WE HAVEN'T ALREADY DONE SO, READ THE IMAGE FILE HEADER
 		if (!m_pHeader)
 		{
@@ -873,19 +894,19 @@ public:
 		if (*(m_pHeader+13) <= 2)
 		{
 			ConvertSectorOrder(m_pHeader+14);
-			SetFilePointer(pImageInfo->hFile, nTrack*TRACK_DENIBBLIZED_SIZE+30, NULL, FILE_BEGIN);
+			SetFilePointer(pImageInfo->hFile, track*TRACK_DENIBBLIZED_SIZE+30, NULL, FILE_BEGIN);
 			ZeroMemory(ms_pWorkBuffer, TRACK_DENIBBLIZED_SIZE);
 			DWORD bytesread;
 			ReadFile(pImageInfo->hFile, ms_pWorkBuffer, TRACK_DENIBBLIZED_SIZE, &bytesread, NULL);
-			*pNibbles = NibblizeTrack(pTrackImageBuffer, eSIMSYSTEMOrder, nTrack);
+			*pNibbles = NibblizeTrack(pTrackImageBuffer, eSIMSYSTEMOrder, track);
 		}
 		// OTHERWISE, IF THIS IMAGE CONTAINS NIBBLE INFORMATION, READ IT DIRECTLY INTO THE TRACK BUFFER
 		else 
 		{
-			*pNibbles = *(LPWORD)(m_pHeader+nTrack*2+14);
+			*pNibbles = *(LPWORD)(m_pHeader+track*2+14);
 			LONG Offset = 88;
-			while (nTrack--)
-				Offset += *(LPWORD)(m_pHeader+nTrack*2+14);
+			while (track--)
+				Offset += *(LPWORD)(m_pHeader+track*2+14);
 			SetFilePointer(pImageInfo->hFile, Offset, NULL,FILE_BEGIN);
 			ZeroMemory(pTrackImageBuffer, *pNibbles);
 			DWORD dwBytesRead;
@@ -893,14 +914,14 @@ public:
 		}
 	}
 
-	virtual void Write(ImageInfo* pImageInfo, int nTrack, int nQuarterTrack, LPBYTE pTrackImage, int nNibbles)
+	virtual void Write(ImageInfo* pImageInfo, const float phase, LPBYTE pTrackImageBuffer, int nNibbles)
 	{
 		// note: unimplemented
 	}
 
 	virtual eImageType GetType(void) { return eImageIIE; }
 	virtual const char* GetCreateExtensions(void) { return ".iie"; }
-	virtual const char* GetRejectExtensions(void) { return ".do.;.nib;.po;.prg;.2mg;.2img"; }
+	virtual const char* GetRejectExtensions(void) { return ".do.;.nib;.po;.prg;.woz;.2mg;.2img"; }
 
 private:
 	void ConvertSectorOrder(LPBYTE sourceorder)
@@ -974,7 +995,7 @@ public:
 
 	virtual eImageType GetType(void) { return eImageAPL; }
 	virtual const char* GetCreateExtensions(void) { return ".apl"; }
-	virtual const char* GetRejectExtensions(void) { return ".do;.dsk;.iie;.nib;.po;.2mg;.2img"; }
+	virtual const char* GetRejectExtensions(void) { return ".do;.dsk;.iie;.nib;.po;.woz;.2mg;.2img"; }
 };
 
 //-------------------------------------
@@ -1025,7 +1046,306 @@ public:
 
 	virtual eImageType GetType(void) { return eImagePRG; }
 	virtual const char* GetCreateExtensions(void) { return ".prg"; }
-	virtual const char* GetRejectExtensions(void) { return ".do;.dsk;.iie;.nib;.po;.2mg;.2img"; }
+	virtual const char* GetRejectExtensions(void) { return ".do;.dsk;.iie;.nib;.po;.woz;.2mg;.2img"; }
+};
+
+//-------------------------------------
+
+class CWOZImageHelper
+{
+public:
+	CWOZImageHelper(void)
+	{
+		m_pWOZEmptyTrack = new BYTE[CWOZHelper::EMPTY_TRACK_SIZE];
+
+		srand(1);	// Use a fixed seed for determinism
+		for (UINT i = 0; i < CWOZHelper::EMPTY_TRACK_SIZE; i++)
+		{
+			BYTE n = 0;
+			for (UINT j = 0; j < 8; j++)
+			{
+				if (rand() < ((RAND_MAX * 3) / 10))	// ~30% of buffer are 1 bits
+					n |= 1 << j;
+			}
+			m_pWOZEmptyTrack[i] = n;
+		}
+	}
+	virtual ~CWOZImageHelper(void) { delete [] m_pWOZEmptyTrack; }
+
+	void ReadEmptyTrack(LPBYTE pTrackImageBuffer, int* pNibbles, UINT* pBitCount)
+	{
+		memcpy(pTrackImageBuffer, m_pWOZEmptyTrack, CWOZHelper::EMPTY_TRACK_SIZE);
+		*pNibbles = CWOZHelper::EMPTY_TRACK_SIZE;
+		*pBitCount = CWOZHelper::EMPTY_TRACK_SIZE * 8;
+		return;
+	}
+
+	bool UpdateWOZHeaderCRC(ImageInfo* pImageInfo, CImageBase* pImageBase, UINT extendedSize)
+	{
+		BYTE* pImage = pImageInfo->pImageBuffer;
+		CWOZHelper::WOZHeader* pWozHdr = (CWOZHelper::WOZHeader*) pImage;
+		pWozHdr->crc32 = crc32(0, pImage+sizeof(CWOZHelper::WOZHeader), pImageInfo->uImageSize-sizeof(CWOZHelper::WOZHeader));
+		return pImageBase->WriteImageHeader(pImageInfo, pImage, sizeof(CWOZHelper::WOZHeader)+extendedSize);
+	}
+
+private:
+	BYTE* m_pWOZEmptyTrack;
+};
+
+//-------------------------------------
+
+class CWOZ1Image : public CImageBase, private CWOZImageHelper
+{
+public:
+	CWOZ1Image(void) {}
+	virtual ~CWOZ1Image(void) {}
+
+	virtual eDetectResult Detect(const LPBYTE pImage, const DWORD dwImageSize, const TCHAR* pszExt)
+	{
+		CWOZHelper::WOZHeader* pWozHdr = (CWOZHelper::WOZHeader*) pImage;
+
+		if (pWozHdr->id1 != CWOZHelper::ID1_WOZ1 || pWozHdr->id2 != CWOZHelper::ID2)
+			return eMismatch;
+
+		m_uNumTracksInImage = CWOZHelper::MAX_TRACKS_5_25;
+		return eMatch;
+	}
+
+	virtual void Read(ImageInfo* pImageInfo, const float phase, LPBYTE pTrackImageBuffer, int* pNibbles, UINT* pBitCount, bool enhanceDisk)
+	{
+		BYTE* pTrackMap = ((CWOZHelper::Tmap*)pImageInfo->pWOZTrackMap)->tmap;
+
+		const BYTE indexFromTMAP = pTrackMap[(UINT)(phase * 2)];
+		if (indexFromTMAP == CWOZHelper::TMAP_TRACK_EMPTY)
+			return ReadEmptyTrack(pTrackImageBuffer, pNibbles, pBitCount);
+
+		ReadTrack(pImageInfo, indexFromTMAP, pTrackImageBuffer, CWOZHelper::WOZ1_TRACK_SIZE);
+		CWOZHelper::TRKv1* pTRK = (CWOZHelper::TRKv1*) &pTrackImageBuffer[CWOZHelper::WOZ1_TRK_OFFSET];
+		*pBitCount = pTRK->bitCount;
+		*pNibbles = pTRK->bytesUsed;
+	}
+
+	// TODO: support writing a bitCount (ie. fractional nibbles)
+	virtual void Write(ImageInfo* pImageInfo, const float phase, LPBYTE pTrackImageBuffer, int nNibbles)
+	{
+		if (nNibbles > CWOZHelper::WOZ1_TRK_OFFSET)
+		{
+			_ASSERT(0);
+			LogFileOutput("WOZ1 Write Track: failed - track too big (%08X, phase=%f) for file: %s\n", nNibbles, phase, pImageInfo->szFilename.c_str());
+			return;
+		}
+
+		UINT hdrExtendedSize = 0;
+		const UINT trkExtendedSize = CWOZHelper::WOZ1_TRACK_SIZE;
+		BYTE* pTrackMap = ((CWOZHelper::Tmap*)pImageInfo->pWOZTrackMap)->tmap;
+
+		BYTE indexFromTMAP = pTrackMap[(UINT)(phase * 2)];
+		if (indexFromTMAP == CWOZHelper::TMAP_TRACK_EMPTY)
+		{
+			const BYTE track = (BYTE)(phase*2);
+			{
+				int highestIdx = -1;
+				for (UINT i=0; i<CWOZHelper::MAX_QUARTER_TRACKS_5_25; i++)
+				{
+					if (pTrackMap[i] != CWOZHelper::TMAP_TRACK_EMPTY && pTrackMap[i] > highestIdx)
+						highestIdx = pTrackMap[i];
+				}
+				indexFromTMAP = (highestIdx == -1) ? 0 : highestIdx+1;
+			}
+			pTrackMap[track] = indexFromTMAP;
+			if (track-1 >= 0) pTrackMap[track-1] = indexFromTMAP;	// WOZ spec: track is also visible from neighboring quarter tracks
+			if (track+1 < CWOZHelper::MAX_QUARTER_TRACKS_5_25)	pTrackMap[track+1] = indexFromTMAP;
+
+			const UINT newImageSize = pImageInfo->uImageSize + trkExtendedSize;
+			BYTE* pNewImageBuffer = new BYTE[newImageSize];
+			memcpy(pNewImageBuffer, pImageInfo->pImageBuffer, pImageInfo->uImageSize);
+
+			// NB. delete old pImageBuffer: pWOZTrackMap updated in WOZUpdateInfo() by parent function
+
+			delete [] pImageInfo->pImageBuffer;
+			pTrackMap = NULL;	// invalidate
+			pImageInfo->pImageBuffer = pNewImageBuffer;
+			pImageInfo->uImageSize = newImageSize;
+
+			// NB. pTrackImageBuffer[] is at least WOZ1_TRACK_SIZE in size
+			memset(&pTrackImageBuffer[nNibbles], 0, CWOZHelper::WOZ1_TRACK_SIZE-nNibbles);
+			CWOZHelper::TRKv1* pTRK = (CWOZHelper::TRKv1*) &pTrackImageBuffer[CWOZHelper::WOZ1_TRK_OFFSET];
+			pTRK->bytesUsed = nNibbles;
+			pTRK->bitCount = nNibbles * 8;
+
+			CWOZHelper::WOZChunkHdr* pTrksHdr = (CWOZHelper::WOZChunkHdr*) &pImageInfo->pImageBuffer[pImageInfo->uOffset - sizeof(CWOZHelper::WOZChunkHdr)];
+			pTrksHdr->size += trkExtendedSize;
+
+			hdrExtendedSize = pImageInfo->uOffset - sizeof(CWOZHelper::WOZHeader);
+		}
+
+		// NB. pTrackImageBuffer[] is at least WOZ1_TRACK_SIZE in size
+		{
+			CWOZHelper::TRKv1* pTRK = (CWOZHelper::TRKv1*) &pTrackImageBuffer[CWOZHelper::WOZ1_TRK_OFFSET];
+			UINT bitCount = pTRK->bitCount;
+			UINT trackSize = pTRK->bytesUsed;
+			_ASSERT(trackSize == nNibbles);
+			if (trackSize != nNibbles)
+			{
+				_ASSERT(0);
+				LogFileOutput("WOZ1 Write Track: (warning) attempting to write %08X when trackSize is %08X (phase=%f)\n", nNibbles, trackSize, phase);
+				// NB. just a warning, not a failure (therefore nNibbles < WOZ1_TRK_OFFSET, due to check at start of function)
+			}
+		}
+
+		if (!WriteTrack(pImageInfo, indexFromTMAP, pTrackImageBuffer, trkExtendedSize))
+		{
+			_ASSERT(0);
+			LogFileOutput("WOZ1 Write Track: failed to write track (phase=%f) for file: %s\n", phase, pImageInfo->szFilename.c_str());
+			return;
+		}
+
+		// TODO: zip/gzip: combine the track & hdr writes so that the file is only compressed & written once
+		if (!UpdateWOZHeaderCRC(pImageInfo, this, hdrExtendedSize))
+		{
+			_ASSERT(0);
+			LogFileOutput("WOZ1 Write Track: failed to write header CRC for file: %s\n", pImageInfo->szFilename.c_str());
+		}
+	}
+
+	virtual eImageType GetType(void) { return eImageWOZ1; }
+	virtual const char* GetCreateExtensions(void) { return ".woz"; }
+	virtual const char* GetRejectExtensions(void) { return ".do;.dsk;.nib;.iie;.po;.prg"; }
+};
+
+//-------------------------------------
+
+class CWOZ2Image : public CImageBase, private CWOZImageHelper
+{
+public:
+	CWOZ2Image(void) {}
+	virtual ~CWOZ2Image(void) {}
+
+	virtual eDetectResult Detect(const LPBYTE pImage, const DWORD dwImageSize, const TCHAR* pszExt)
+	{
+		CWOZHelper::WOZHeader* pWozHdr = (CWOZHelper::WOZHeader*) pImage;
+
+		if (pWozHdr->id1 != CWOZHelper::ID1_WOZ2 || pWozHdr->id2 != CWOZHelper::ID2)
+			return eMismatch;
+
+		m_uNumTracksInImage = CWOZHelper::MAX_TRACKS_5_25;
+		return eMatch;
+	}
+
+	virtual void Read(ImageInfo* pImageInfo, const float phase, LPBYTE pTrackImageBuffer, int* pNibbles, UINT* pBitCount, bool enhanceDisk)
+	{
+		BYTE* pTrackMap = ((CWOZHelper::Tmap*)pImageInfo->pWOZTrackMap)->tmap;
+
+		const BYTE indexFromTMAP = pTrackMap[(BYTE)(phase * 2)];
+		if (indexFromTMAP == CWOZHelper::TMAP_TRACK_EMPTY)
+			return ReadEmptyTrack(pTrackImageBuffer, pNibbles, pBitCount);
+
+		CWOZHelper::TRKv2* pTRKS = (CWOZHelper::TRKv2*) &pImageInfo->pImageBuffer[pImageInfo->uOffset];
+		CWOZHelper::TRKv2* pTRK = &pTRKS[indexFromTMAP];
+		*pBitCount = pTRK->bitCount;
+		*pNibbles = (pTRK->bitCount+7) / 8;
+
+		const UINT maxNibblesPerTrack = pImageInfo->maxNibblesPerTrack;
+		if (*pNibbles > (int)maxNibblesPerTrack)
+		{
+			_ASSERT(0);
+			LogFileOutput("WOZ2 Read Track: attempting to read more than max nibbles! (phase=%f)\n", phase);
+			return ReadEmptyTrack(pTrackImageBuffer, pNibbles, pBitCount);	// TODO: Enlarge track buffer, but for now just return an empty track
+		}
+
+		memcpy(pTrackImageBuffer, &pImageInfo->pImageBuffer[pTRK->startBlock*CWOZHelper::BLOCK_SIZE], *pNibbles);
+	}
+
+	// TODO: support writing a bitCount (ie. fractional nibbles)
+	virtual void Write(ImageInfo* pImageInfo, const float phase, LPBYTE pTrackImageBuffer, int nNibbles)
+	{
+		UINT hdrExtendedSize = 0;
+		UINT trkExtendedSize = nNibbles;
+		BYTE* pTrackMap = ((CWOZHelper::Tmap*)pImageInfo->pWOZTrackMap)->tmap;
+
+		BYTE indexFromTMAP = pTrackMap[(BYTE)(phase * 2)];
+		if (indexFromTMAP == CWOZHelper::TMAP_TRACK_EMPTY)
+		{
+			const BYTE track = (BYTE)(phase*2);
+			{
+				int highestIdx = -1;
+				for (UINT i=0; i<CWOZHelper::MAX_QUARTER_TRACKS_5_25; i++)
+				{
+					if (pTrackMap[i] != CWOZHelper::TMAP_TRACK_EMPTY && pTrackMap[i] > highestIdx)
+						highestIdx = pTrackMap[i];
+				}
+				indexFromTMAP = (highestIdx == -1) ? 0 : highestIdx+1;
+			}
+			pTrackMap[track] = indexFromTMAP;
+			if (track-1 >= 0) pTrackMap[track-1] = indexFromTMAP;	// WOZ spec: track is also visible from neighboring quarter tracks
+			if (track+1 < CWOZHelper::MAX_QUARTER_TRACKS_5_25)	pTrackMap[track+1] = indexFromTMAP;
+
+			trkExtendedSize = (nNibbles + CWOZHelper::BLOCK_SIZE-1) & ~(CWOZHelper::BLOCK_SIZE-1);
+			const UINT newImageSize = pImageInfo->uImageSize + trkExtendedSize;
+			BYTE* pNewImageBuffer = new BYTE[newImageSize];
+
+			memcpy(pNewImageBuffer, pImageInfo->pImageBuffer, pImageInfo->uImageSize);
+			memset(pNewImageBuffer+pImageInfo->uImageSize, 0, trkExtendedSize);
+
+			// NB. delete old pImageBuffer: pWOZTrackMap updated in WOZUpdateInfo() by parent function
+
+			delete [] pImageInfo->pImageBuffer;
+			pTrackMap = NULL;	// invalidate
+			pImageInfo->pImageBuffer = pNewImageBuffer;
+			pImageInfo->uImageSize = newImageSize;
+
+			CWOZHelper::TRKv2* pTRKS = (CWOZHelper::TRKv2*) &pImageInfo->pImageBuffer[pImageInfo->uOffset];
+			CWOZHelper::TRKv2* pTRK = &pTRKS[indexFromTMAP];
+			pTRK->blockCount = trkExtendedSize / CWOZHelper::BLOCK_SIZE;
+			pTRK->startBlock = 3;
+			for (UINT i=0; i<indexFromTMAP; i++)
+				pTRK->startBlock += pTRKS[i].blockCount;
+			pTRK->bitCount = nNibbles * 8;
+
+			CWOZHelper::WOZChunkHdr* pTrksHdr = (CWOZHelper::WOZChunkHdr*) (&pImageInfo->pImageBuffer[pImageInfo->uOffset] - sizeof(CWOZHelper::WOZChunkHdr));
+			pTrksHdr->size += trkExtendedSize;
+
+			hdrExtendedSize = ((BYTE*)pTRKS + sizeof(CWOZHelper::Trks) - pNewImageBuffer) - sizeof(CWOZHelper::WOZHeader);
+		}
+
+		CWOZHelper::TRKv2* pTRKS = (CWOZHelper::TRKv2*) &pImageInfo->pImageBuffer[pImageInfo->uOffset];
+		CWOZHelper::TRKv2* pTRK = &pTRKS[indexFromTMAP];
+		{
+			UINT bitCount = pTRK->bitCount;
+			UINT trackSize = (pTRK->bitCount + 7) / 8;
+			_ASSERT(trackSize == nNibbles);
+			if (trackSize != nNibbles)
+			{
+				_ASSERT(0);
+				LogFileOutput("WOZ2 Write Track: attempting to write %08X when trackSize is %08X (phase=%f)\n", nNibbles, trackSize, phase);
+				return;
+			}
+		}
+
+		const long offset = pTRK->startBlock * CWOZHelper::BLOCK_SIZE;
+		memcpy(&pImageInfo->pImageBuffer[offset], pTrackImageBuffer, nNibbles);
+
+		if (!WriteImageData(pImageInfo, &pImageInfo->pImageBuffer[offset], trkExtendedSize, offset))
+		{
+			_ASSERT(0);
+			LogFileOutput("WOZ2 Write Track: failed to write track (phase=%f) for file: %s\n", phase, pImageInfo->szFilename.c_str());
+			return;
+		}
+
+		// TODO: zip/gzip: combine the track & hdr writes so that the file is only compressed & written once
+		if (!UpdateWOZHeaderCRC(pImageInfo, this, hdrExtendedSize))
+		{
+			_ASSERT(0);
+			LogFileOutput("WOZ2 Write Track: failed to write header CRC for file: %s\n", pImageInfo->szFilename.c_str());
+		}
+	}
+
+	virtual bool AllowCreate(void) { return true; }
+	virtual UINT GetImageSizeForCreate(void) { m_uNumTracksInImage = CWOZHelper::MAX_TRACKS_5_25; return sizeof(CWOZHelper::WOZHeader); }
+
+	virtual eImageType GetType(void) { return eImageWOZ2; }
+	virtual const char* GetCreateExtensions(void) { return ".woz"; }
+	virtual const char* GetRejectExtensions(void) { return ".do;.dsk;.nib;.iie;.po;.prg"; }
 };
 
 //-----------------------------------------------------------------------------
@@ -1048,6 +1368,8 @@ eDetectResult CMacBinaryHelper::DetectHdr(LPBYTE& pImage, DWORD& dwImageSize, DW
 
 	return eMismatch;
 }
+
+//-----------------------------------------------------------------------------
 
 eDetectResult C2IMGHelper::DetectHdr(LPBYTE& pImage, DWORD& dwImageSize, DWORD& dwOffset)
 {
@@ -1100,7 +1422,7 @@ eDetectResult C2IMGHelper::DetectHdr(LPBYTE& pImage, DWORD& dwImageSize, DWORD& 
 		break;
 	case e2IMGFormatNIBData:
 		{
-			if (pHdr->DiskDataLength != TRACKS_STANDARD*NIBBLES_PER_TRACK)
+			if (pHdr->DiskDataLength != TRACKS_STANDARD*NIBBLES_PER_TRACK_NIB)
 				return eMismatch;
 		}
 		break;
@@ -1127,11 +1449,60 @@ bool C2IMGHelper::IsLocked(void)
 
 //-----------------------------------------------------------------------------
 
+// Pre: already matched the WOZ header
+eDetectResult CWOZHelper::ProcessChunks(ImageInfo* pImageInfo, DWORD& dwOffset)
+{
+	UINT32* pImage32 = (uint32_t*) (pImageInfo->pImageBuffer + sizeof(WOZHeader));
+	int imageSizeRemaining = pImageInfo->uImageSize - sizeof(WOZHeader);
+	_ASSERT(imageSizeRemaining >= 0);
+	if (imageSizeRemaining < 0)
+		return eMismatch;
+
+	while(imageSizeRemaining >= sizeof(WOZChunkHdr))
+	{
+		UINT32 chunkId = *pImage32++;
+		UINT32 chunkSize = *pImage32++;
+		imageSizeRemaining -= sizeof(WOZChunkHdr);
+
+		switch(chunkId)
+		{
+			case INFO_CHUNK_ID:
+				m_pInfo = (InfoChunkv2*)pImage32;
+				if (m_pInfo->v1.diskType != InfoChunk::diskType5_25)
+					return eMismatch;
+				break;
+			case TMAP_CHUNK_ID:
+				pImageInfo->pWOZTrackMap = (BYTE*) pImage32;
+				break;
+			case TRKS_CHUNK_ID:
+				dwOffset = pImageInfo->uOffset = pImageInfo->uImageSize - imageSizeRemaining;	// offset into image of track data
+				break;
+			case WRIT_CHUNK_ID:	// WOZ v2 (optional)
+				break;
+			case META_CHUNK_ID:	// (optional)
+				break;
+			default:	// no idea what this chunk is, so skip it
+				_ASSERT(0);
+				break;
+		}
+
+		pImage32 = (UINT32*) ((BYTE*)pImage32 + chunkSize);
+		imageSizeRemaining -= chunkSize;
+		_ASSERT(imageSizeRemaining >= 0);
+		if (imageSizeRemaining < 0)
+			return eMismatch;
+	}
+
+	return eMatch;
+}
+
+//-----------------------------------------------------------------------------
+
 // NB. Of the 6 cases (floppy/harddisk x gzip/zip/normal) only harddisk-normal isn't read entirely to memory
 // - harddisk-normal-create also doesn't create a max size image-buffer
 
 // DETERMINE THE FILE'S EXTENSION AND CONVERT IT TO LOWERCASE
-void GetCharLowerExt(TCHAR* pszExt, LPCTSTR pszImageFilename, const UINT uExtSize)
+void CImageHelperBase::GetCharLowerExt(TCHAR* pszExt, LPCTSTR pszImageFilename, const UINT uExtSize)
 {
 	LPCTSTR pImageFileExt = pszImageFilename;
 
@@ -1147,7 +1518,7 @@ void GetCharLowerExt(TCHAR* pszExt, LPCTSTR pszImageFilename, const UINT uExtSiz
 	CharLowerBuff(pszExt, _tcslen(pszExt));
 }
 
-void GetCharLowerExt2(TCHAR* pszExt, LPCTSTR pszImageFilename, const UINT uExtSize)
+void CImageHelperBase::GetCharLowerExt2(TCHAR* pszExt, LPCTSTR pszImageFilename, const UINT uExtSize)
 {
 	TCHAR szFilename[MAX_PATH];
 	_tcsncpy(szFilename, pszImageFilename, MAX_PATH);
@@ -1172,11 +1543,12 @@ ImageError_e CImageHelperBase::CheckGZipFile(LPCTSTR pszImageFilename, ImageInfo
 	pImageInfo->pImageBuffer = new BYTE[MAX_UNCOMPRESSED_SIZE];
 
 	int nLen = gzread(hGZFile, pImageInfo->pImageBuffer, MAX_UNCOMPRESSED_SIZE);
+	int nRes = gzclose(hGZFile);	// close before returning (due to error) to avoid resource leak
+	hGZFile = NULL;
+
 	if (nLen < 0 || nLen == MAX_UNCOMPRESSED_SIZE)
 		return eIMAGE_ERROR_BAD_SIZE;
 
-	int nRes = gzclose(hGZFile);
-	hGZFile = NULL;
 	if (nRes != Z_OK)
 		return eIMAGE_ERROR_GZ;
 
@@ -1188,7 +1560,7 @@ ImageError_e CImageHelperBase::CheckGZipFile(LPCTSTR pszImageFilename, ImageInfo
 
 	DWORD dwSize = nLen;
 	DWORD dwOffset = 0;
-	CImageBase* pImageType = Detect(pImageInfo->pImageBuffer, dwSize, szExt, dwOffset, &pImageInfo->bWriteProtected);
+	CImageBase* pImageType = Detect(pImageInfo->pImageBuffer, dwSize, szExt, dwOffset, pImageInfo);
 
 	if (!pImageType)
 		return eIMAGE_ERROR_UNSUPPORTED;
@@ -1197,11 +1569,7 @@ ImageError_e CImageHelperBase::CheckGZipFile(LPCTSTR pszImageFilename, ImageInfo
 	if (Type == eImageAPL || Type == eImageIIE || Type == eImagePRG)
 		return eIMAGE_ERROR_UNSUPPORTED;
 
-	pImageInfo->FileType = eFileGZip;
-	pImageInfo->uOffset = dwOffset;
-	pImageInfo->pImageType = pImageType;
-	pImageInfo->uImageSize = dwSize;
-
+	SetImageInfo(pImageInfo, eFileGZip, dwOffset, pImageType, dwSize);
 	return eIMAGE_ERROR_NONE;
 }
 
@@ -1217,93 +1585,132 @@ ImageError_e CImageHelperBase::CheckZipFile(LPCTSTR pszImageFilename, ImageInfo*
 	unz_file_info file_info;
 	char szFilename[MAX_PATH];
 	memset(szFilename, 0, sizeof(szFilename));
-	int nRes = 0, nLen = 0;
+	BYTE* pImageBuffer = NULL;
+	ImageInfo* pImageInfo2 = NULL;
+	CImageBase* pImageType = NULL;
+	UINT numValidImages = 0;
 
 	try
 	{
-		nRes = unzGetGlobalInfo(hZipFile, &global_info);
+		int nRes = unzGetGlobalInfo(hZipFile, &global_info);
 		if (nRes != UNZ_OK)
 			throw eIMAGE_ERROR_ZIP;
 
-		nRes = unzGoToFirstFile(hZipFile);	// Only support 1st file in zip archive for now
+		nRes = unzGoToFirstFile(hZipFile);
 		if (nRes != UNZ_OK)
 			throw eIMAGE_ERROR_ZIP;
 
-		nRes = unzGetCurrentFileInfo(hZipFile, &file_info, szFilename, MAX_PATH, NULL, 0, NULL, 0);
-		if (nRes != UNZ_OK)
-			throw eIMAGE_ERROR_ZIP;
-
-		const UINT uFileSize = file_info.uncompressed_size;
-		if (uFileSize > GetMaxImageSize())
-			throw eIMAGE_ERROR_BAD_SIZE;
-
-		pImageInfo->pImageBuffer = new BYTE[uFileSize];
-
-		nRes = unzOpenCurrentFile(hZipFile);
-		if (nRes != UNZ_OK)
-			throw eIMAGE_ERROR_ZIP;
-
-		nLen = unzReadCurrentFile(hZipFile, pImageInfo->pImageBuffer, uFileSize);
-		if (nLen < 0)
+		for (UINT n=0; n<global_info.number_entry; n++)
 		{
-			unzCloseCurrentFile(hZipFile);	// Must CloseCurrentFile before Close
-			throw eIMAGE_ERROR_UNSUPPORTED;
-		}
+			if (n)
+			{
+				nRes = unzGoToNextFile(hZipFile);
+				if (nRes == UNZ_END_OF_LIST_OF_FILE)
+					break;
+				if (nRes != UNZ_OK)
+					throw eIMAGE_ERROR_ZIP;
+			}
 
-		nRes = unzCloseCurrentFile(hZipFile);
-		if (nRes != UNZ_OK)
-			throw eIMAGE_ERROR_ZIP;
+			nRes = unzGetCurrentFileInfo(hZipFile, &file_info, szFilename, MAX_PATH, NULL, 0, NULL, 0);
+			if (nRes != UNZ_OK)
+				throw eIMAGE_ERROR_ZIP;
+
+			const UINT uFileSize = file_info.uncompressed_size;
+			if (uFileSize > GetMaxImageSize())
+				throw eIMAGE_ERROR_BAD_SIZE;
+
+			if (uFileSize == 0)	// skip directories or empty files
+				continue;
+
+			//
+
+			nRes = unzOpenCurrentFile(hZipFile);
+			if (nRes != UNZ_OK)
+				throw eIMAGE_ERROR_ZIP;
+
+			BYTE* pImageBuffer = new BYTE[uFileSize];
+			int nLen = unzReadCurrentFile(hZipFile, pImageBuffer, uFileSize);
+			if (nLen < 0)
+			{
+				unzCloseCurrentFile(hZipFile);	// Must CloseCurrentFile before Close
+				throw eIMAGE_ERROR_UNSUPPORTED;
+			}
+
+			nRes = unzCloseCurrentFile(hZipFile);
+			if (nRes != UNZ_OK)
+				throw eIMAGE_ERROR_ZIP;
+
+			// Determine the file's extension and convert it to lowercase
+			TCHAR szExt[_MAX_EXT] = "";
+			GetCharLowerExt(szExt, szFilename, _MAX_EXT);
+
+			DWORD dwSize = nLen;
+			DWORD dwOffset = 0;
+
+			ImageInfo*& pImageInfoForDetect = !pImageInfo2 ? pImageInfo : pImageInfo2;
+			pImageInfoForDetect->pImageBuffer = pImageBuffer;
+			CImageBase* pNewImageType = Detect(pImageBuffer, dwSize, szExt, dwOffset, pImageInfoForDetect);
+
+			if (pNewImageType)
+			{
+				numValidImages++;
+
+				if (numValidImages == 1)
+				{
+					pImageType = pNewImageType;
+
+					pImageInfo->szFilenameInZip = szFilename;
+					memcpy(&pImageInfo->zipFileInfo.tmz_date, &file_info.tmu_date, sizeof(file_info.tmu_date));
+					pImageInfo->zipFileInfo.dosDate     = file_info.dosDate;
+					pImageInfo->zipFileInfo.internal_fa = file_info.internal_fa;
+					pImageInfo->zipFileInfo.external_fa = file_info.external_fa;
+					pImageInfo->uNumEntriesInZip = global_info.number_entry;
+					pImageInfo->pImageBuffer = pImageBuffer;
+
+					pImageBuffer = NULL;
+					strFilenameInZip = szFilename;
+
+					SetImageInfo(pImageInfo, eFileZip, dwOffset, pImageType, dwSize);
+
+					pImageInfo2 = new ImageInfo();	// use this dummy one, as some members get overwritten during Detect()
+				}
+			}
+
+			delete [] pImageBuffer;
+			pImageBuffer = NULL;
+		}
 	}
 	catch (ImageError_e error)
 	{
 		if (hZipFile)
 			unzClose(hZipFile);
 
+		delete [] pImageBuffer;
+		delete pImageInfo2;
+
 		return error;
 	}
 
-	nRes = unzClose(hZipFile);
+	delete pImageInfo2;
+
+	int nRes = unzClose(hZipFile);
 	hZipFile = NULL;
 	if (nRes != UNZ_OK)
 		return eIMAGE_ERROR_ZIP;
 
-	strncpy(pImageInfo->szFilenameInZip, szFilename, MAX_PATH);
-	memcpy(&pImageInfo->zipFileInfo.tmz_date, &file_info.tmu_date, sizeof(file_info.tmu_date));
-	pImageInfo->zipFileInfo.dosDate     = file_info.dosDate;
-	pImageInfo->zipFileInfo.internal_fa = file_info.internal_fa;
-	pImageInfo->zipFileInfo.external_fa = file_info.external_fa;
-	pImageInfo->uNumEntriesInZip = global_info.number_entry;
-	strFilenameInZip = szFilename;
-
 	//
 
-	// Determine the file's extension and convert it to lowercase
-	TCHAR szExt[_MAX_EXT] = "";
-	GetCharLowerExt(szExt, szFilename, _MAX_EXT);
-
-	DWORD dwSize = nLen;
-	DWORD dwOffset = 0;
-	CImageBase* pImageType = Detect(pImageInfo->pImageBuffer, dwSize, szExt, dwOffset, &pImageInfo->bWriteProtected);
-
 	if (!pImageType)
-	{
-		if (global_info.number_entry > 1)
-			return eIMAGE_ERROR_UNSUPPORTED_MULTI_ZIP;
-
 		return eIMAGE_ERROR_UNSUPPORTED;
-	}
 
 	const eImageType Type = pImageType->GetType();
 	if (Type == eImageAPL || Type == eImageIIE || Type == eImagePRG)
 		return eIMAGE_ERROR_UNSUPPORTED;
 
 	if (global_info.number_entry > 1)
-		pImageInfo->bWriteProtected = 1;	// Zip archives with multiple files are read-only (for now)
+		pImageInfo->bWriteProtected = 1;	// Zip archives with multiple files are read-only (for now) - see WriteImageData() for zipfile
 
-	pImageInfo->FileType = eFileZip;
-	pImageInfo->uOffset = dwOffset;
-	pImageInfo->pImageType = pImageType;
-	pImageInfo->uImageSize = dwSize;
+	pImageInfo->uNumValidImagesInZip = numValidImages;
 
 	return eIMAGE_ERROR_NONE;
 }
@@ -1384,7 +1791,7 @@ ImageError_e CImageHelperBase::CheckNormalFile(LPCTSTR pszImageFilename, ImageIn
 			return eIMAGE_ERROR_BAD_SIZE;
 		}
 
-		pImageType = Detect(pImageInfo->pImageBuffer, dwSize, szExt, dwOffset, &pImageInfo->bWriteProtected);
+		pImageType = Detect(pImageInfo->pImageBuffer, dwSize, szExt, dwOffset, pImageInfo);
 		if (bTempDetectBuffer)
 		{
 			delete [] pImageInfo->pImageBuffer;
@@ -1399,19 +1806,29 @@ ImageError_e CImageHelperBase::CheckNormalFile(LPCTSTR pszImageFilename, ImageIn
 		pImageType = GetImageForCreation(szExt, &dwSize);
 		if (pImageType && dwSize)
 		{
-			pImageInfo->pImageBuffer = new BYTE [dwSize];
-
-			if (pImageType->GetType() != eImageNIB1)
+			if (pImageType->GetType() == eImageWOZ2)
 			{
-				ZeroMemory(pImageInfo->pImageBuffer, dwSize);
+				pImageInfo->pImageBuffer = m_WOZHelper.CreateEmptyDisk(dwSize);
+				pImageInfo->uImageSize = dwSize;
+				bool res = WOZUpdateInfo(pImageInfo, dwOffset);
+				_ASSERT(res);
 			}
 			else
 			{
-				// Fill zero-length image buffer with alternating high-bit-set nibbles (GH#196, GH#338)
-				for (UINT i=0; i<dwSize; i+=2)
+				pImageInfo->pImageBuffer = new BYTE[dwSize];
+
+				if (pImageType->GetType() == eImageNIB1)
 				{
-					pImageInfo->pImageBuffer[i+0] = 0x80;	// bit7 set, but 0x80 is an invalid nibble
-					pImageInfo->pImageBuffer[i+1] = 0x81;	// bit7 set, but 0x81 is an invalid nibble
+					// Fill zero-length image buffer with alternating high-bit-set nibbles (GH#196, GH#338)
+					for (UINT i=0; i<dwSize; i+=2)
+					{
+						pImageInfo->pImageBuffer[i+0] = 0x80;	// bit7 set, but 0x80 is an invalid nibble
+						pImageInfo->pImageBuffer[i+1] = 0x81;	// bit7 set, but 0x81 is an invalid nibble
+					}
+				}
+				else
+				{
+					ZeroMemory(pImageInfo->pImageBuffer, dwSize);
 				}
 			}
 
@@ -1437,12 +1854,18 @@ ImageError_e CImageHelperBase::CheckNormalFile(LPCTSTR pszImageFilename, ImageIn
 		return eIMAGE_ERROR_UNSUPPORTED;
 	}
 
-	pImageInfo->FileType = eFileNormal;
+	SetImageInfo(pImageInfo, eFileNormal, dwOffset, pImageType, dwSize);
+	return eIMAGE_ERROR_NONE;
+}
+
+//-------------------------------------
+
+void CImageHelperBase::SetImageInfo(ImageInfo* pImageInfo, FileType_e fileType, DWORD dwOffset, CImageBase* pImageType, DWORD dwSize)
+{
+	pImageInfo->FileType = fileType;
 	pImageInfo->uOffset = dwOffset;
 	pImageInfo->pImageType = pImageType;
 	pImageInfo->uImageSize = dwSize;
-
-	return eIMAGE_ERROR_NONE;
 }
 
 //-------------------------------------
@@ -1457,11 +1880,11 @@ ImageError_e CImageHelperBase::Open(	LPCTSTR pszImageFilename,
 	ImageError_e Err;
     const size_t uStrLen = strlen(pszImageFilename);
 
-    if (uStrLen > GZ_SUFFIX_LEN && strcmp(pszImageFilename+uStrLen-GZ_SUFFIX_LEN, GZ_SUFFIX) == 0)
+    if (uStrLen > GZ_SUFFIX_LEN && _stricmp(pszImageFilename+uStrLen-GZ_SUFFIX_LEN, GZ_SUFFIX) == 0)
 	{
 		Err = CheckGZipFile(pszImageFilename, pImageInfo);
 	}
-    else if (uStrLen > ZIP_SUFFIX_LEN && strcmp(pszImageFilename+uStrLen-ZIP_SUFFIX_LEN, ZIP_SUFFIX) == 0)
+    else if (uStrLen > ZIP_SUFFIX_LEN && _stricmp(pszImageFilename+uStrLen-ZIP_SUFFIX_LEN, ZIP_SUFFIX) == 0)
 	{
 		Err = CheckZipFile(pszImageFilename, pImageInfo, strFilenameInZip);
 	}
@@ -1476,7 +1899,9 @@ ImageError_e CImageHelperBase::Open(	LPCTSTR pszImageFilename,
 	if (Err != eIMAGE_ERROR_NONE)
 		return Err;
 
-	DWORD uNameLen = GetFullPathName(pszImageFilename, MAX_PATH, pImageInfo->szFilename, NULL);
+	TCHAR szFilename[MAX_PATH] = { 0 };
+	DWORD uNameLen = GetFullPathName(pszImageFilename, MAX_PATH, szFilename, NULL);
+	pImageInfo->szFilename = szFilename;
 	if (uNameLen == 0 || uNameLen >= MAX_PATH)
 		Err = eIMAGE_ERROR_FAILED_TO_GET_PATHNAME;
 
@@ -1485,7 +1910,7 @@ ImageError_e CImageHelperBase::Open(	LPCTSTR pszImageFilename,
 
 //-------------------------------------
 
-void CImageHelperBase::Close(ImageInfo* pImageInfo, const bool bDeleteFile)
+void CImageHelperBase::Close(ImageInfo* pImageInfo)
 {
 	if (pImageInfo->hFile != INVALID_HANDLE_VALUE)
 	{
@@ -1493,15 +1918,31 @@ void CImageHelperBase::Close(ImageInfo* pImageInfo, const bool bDeleteFile)
 		pImageInfo->hFile = INVALID_HANDLE_VALUE;
 	}
 
-	if (bDeleteFile)
-	{
-		DeleteFile(pImageInfo->szFilename);
-	}
-
-	pImageInfo->szFilename[0] = 0;
+	pImageInfo->szFilename.clear();
 
 	delete [] pImageInfo->pImageBuffer;
 	pImageInfo->pImageBuffer = NULL;
+}
+
+//-------------------------------------
+
+bool CImageHelperBase::WOZUpdateInfo(ImageInfo* pImageInfo, DWORD& dwOffset)
+{
+	if (m_WOZHelper.ProcessChunks(pImageInfo, dwOffset) != eMatch)
+	{
+		_ASSERT(0);
+		return false;
+	}
+
+	if (m_WOZHelper.IsWriteProtected())
+		pImageInfo->bWriteProtected = true;
+
+	pImageInfo->optimalBitTiming = m_WOZHelper.GetOptimalBitTiming();
+	pImageInfo->maxNibblesPerTrack = m_WOZHelper.GetMaxNibblesPerTrack();
+	pImageInfo->bootSectorFormat = m_WOZHelper.GetBootSectorFormat();
+
+	m_WOZHelper.InvalidateInfo();
+	return true;
 }
 
 //-----------------------------------------------------------------------------
@@ -1517,54 +1958,74 @@ CDiskImageHelper::CDiskImageHelper(void) :
 	m_vecImageTypes.push_back( new CIIeImage );
 	m_vecImageTypes.push_back( new CAplImage );
 	m_vecImageTypes.push_back( new CPrgImage );
+	m_vecImageTypes.push_back( new CWOZ1Image );
+	m_vecImageTypes.push_back( new CWOZ2Image );
 }
 
-CImageBase* CDiskImageHelper::Detect(LPBYTE pImage, DWORD dwSize, const TCHAR* pszExt, DWORD& dwOffset, bool* pWriteProtected_)
+CImageBase* CDiskImageHelper::Detect(LPBYTE pImage, DWORD dwSize, const TCHAR* pszExt, DWORD& dwOffset, ImageInfo* pImageInfo)
 {
 	dwOffset = 0;
 	m_MacBinaryHelper.DetectHdr(pImage, dwSize, dwOffset);
 	m_Result2IMG = m_2IMGHelper.DetectHdr(pImage, dwSize, dwOffset);
+	pImageInfo->maxNibblesPerTrack = NIBBLES_PER_TRACK;	// Start with the default size (for all types). May get changed below.
 
 	// CALL THE DETECTION FUNCTIONS IN ORDER, LOOKING FOR A MATCH
-	eImageType ImageType = eImageUNKNOWN;
-	eImageType PossibleType = eImageUNKNOWN;
+	eImageType imageType = eImageUNKNOWN;
+	eImageType possibleType = eImageUNKNOWN;
 
 	if (m_Result2IMG == eMatch)
 	{
 		if (m_2IMGHelper.IsImageFormatDOS33())
-			ImageType = eImageDO;
+			imageType = eImageDO;
 		else if (m_2IMGHelper.IsImageFormatProDOS())
-			ImageType = eImagePO;
+			imageType = eImagePO;
 
-		if (ImageType != eImageUNKNOWN)
+		if (imageType != eImageUNKNOWN)
 		{
-			CImageBase* pImageType = GetImage(ImageType);
+			CImageBase* pImageType = GetImage(imageType);
 			if (!pImageType || !pImageType->IsValidImageSize(dwSize))
-				ImageType = eImageUNKNOWN;
+				imageType = eImageUNKNOWN;
 		}
 	}
 
-	if (ImageType == eImageUNKNOWN)
+	if (imageType == eImageUNKNOWN)
 	{
-		for (UINT uLoop=0; uLoop < GetNumImages() && ImageType == eImageUNKNOWN; uLoop++)
+		for (UINT uLoop=0; uLoop < GetNumImages() && imageType == eImageUNKNOWN; uLoop++)
 		{
 			if (*pszExt && _tcsstr(GetImage(uLoop)->GetRejectExtensions(), pszExt))
 				continue;
 
 			eDetectResult Result = GetImage(uLoop)->Detect(pImage, dwSize, pszExt);
 			if (Result == eMatch)
-				ImageType = GetImage(uLoop)->GetType();
-			else if ((Result == ePossibleMatch) && (PossibleType == eImageUNKNOWN))
-				PossibleType = GetImage(uLoop)->GetType();
+				imageType = GetImage(uLoop)->GetType();
+			else if ((Result == ePossibleMatch) && (possibleType == eImageUNKNOWN))
+				possibleType = GetImage(uLoop)->GetType();
 		}
 	}
 
-	if (ImageType == eImageUNKNOWN)
-		ImageType = PossibleType;
+	if (imageType == eImageUNKNOWN)
+		imageType = possibleType;
 
-	CImageBase* pImageType = GetImage(ImageType);
+	CImageBase* pImageType = GetImage(imageType);
+	if (!pImageType)
+		return NULL;
 
-	if (pImageType)
+	if (imageType == eImageWOZ1 || imageType == eImageWOZ2)
+	{
+		CWOZHelper::WOZHeader* pWozHdr = (CWOZHelper::WOZHeader*) pImage;
+		if (pWozHdr->crc32 && // WOZ spec: CRC of 0 should be ignored
+			pWozHdr->crc32 != crc32(0, pImage+sizeof(CWOZHelper::WOZHeader), dwSize-sizeof(CWOZHelper::WOZHeader)))
+		{
+			int res = MessageBox(GetDesktopWindow(), "CRC mismatch\nContinue using image?", "AppleWin: WOZ Header", MB_ICONSTOP | MB_SETFOREGROUND | MB_YESNO);
+			if (res == IDNO)
+				return NULL;
+		}
+
+		pImageInfo->uImageSize = dwSize;
+		if (!WOZUpdateInfo(pImageInfo, dwOffset))
+			return NULL;
+	}
+	else
 	{
 		if (pImageType->AllowRW())
 		{
@@ -1578,8 +2039,8 @@ CImageBase* CDiskImageHelper::Detect(LPBYTE pImage, DWORD dwSize, const TCHAR* p
 		{
 			pImageType->SetVolumeNumber( m_2IMGHelper.GetVolumeNumber() );
 
-			if (m_2IMGHelper.IsLocked() && !*pWriteProtected_)
-				*pWriteProtected_ = 1;
+			if (m_2IMGHelper.IsLocked())
+				pImageInfo->bWriteProtected = true;
 		}
 		else
 		{
@@ -1592,7 +2053,7 @@ CImageBase* CDiskImageHelper::Detect(LPBYTE pImage, DWORD dwSize, const TCHAR* p
 
 CImageBase* CDiskImageHelper::GetImageForCreation(const TCHAR* pszExt, DWORD* pCreateImageSize)
 {
-	// WE CREATE ONLY DOS ORDER (DO) OR 6656-NIBBLE (NIB) FORMAT FILES
+	// WE CREATE ONLY DOS ORDER (DO), 6656-NIBBLE (NIB) OR WOZ2 (WOZ) FORMAT FILES
 	for (UINT uLoop = 0; uLoop < GetNumImages(); uLoop++)
 	{
 		if (!GetImage(uLoop)->AllowCreate())
@@ -1601,9 +2062,8 @@ CImageBase* CDiskImageHelper::GetImageForCreation(const TCHAR* pszExt, DWORD* pC
 		if (*pszExt && _tcsstr(GetImage(uLoop)->GetCreateExtensions(), pszExt))
 		{
 			CImageBase* pImageType = GetImage(uLoop);
-			SetNumTracksInImage(pImageType, TRACKS_STANDARD);	// Assume default # tracks
 
-			*pCreateImageSize = pImageType->GetImageSizeForCreate();
+			*pCreateImageSize = pImageType->GetImageSizeForCreate();	// Also sets m_uNumTracksInImage
 			if (*pCreateImageSize == (UINT)-1)
 				return NULL;
 
@@ -1634,7 +2094,7 @@ CHardDiskImageHelper::CHardDiskImageHelper(void) :
 	m_vecImageTypes.push_back( new CHDVImage );
 }
 
-CImageBase* CHardDiskImageHelper::Detect(LPBYTE pImage, DWORD dwSize, const TCHAR* pszExt, DWORD& dwOffset, bool* pWriteProtected_)
+CImageBase* CHardDiskImageHelper::Detect(LPBYTE pImage, DWORD dwSize, const TCHAR* pszExt, DWORD& dwOffset, ImageInfo* pImageInfo)
 {
 	dwOffset = 0;
 	m_Result2IMG = m_2IMGHelper.DetectHdr(pImage, dwSize, dwOffset);
@@ -1659,10 +2119,14 @@ CImageBase* CHardDiskImageHelper::Detect(LPBYTE pImage, DWORD dwSize, const TCHA
 	{
 		if (m_Result2IMG == eMatch)
 		{
-			if (m_2IMGHelper.IsLocked() && !*pWriteProtected_)
-				*pWriteProtected_ = 1;
+			if (m_2IMGHelper.IsLocked())
+				pImageInfo->bWriteProtected = true;
 		}
 	}
+
+	pImageInfo->pWOZTrackMap = 0;	// TODO: WOZ
+	pImageInfo->optimalBitTiming = 0;	// TODO: WOZ
+	pImageInfo->maxNibblesPerTrack = 0;	// TODO
 
 	return pImageType;
 }
@@ -1703,3 +2167,102 @@ UINT CHardDiskImageHelper::GetMinDetectSize(const UINT uImageSize, bool* pTempDe
 	*pTempDetectBuffer = true;
 	return m_2IMGHelper.GetMaxHdrSize();
 }
+
+//-----------------------------------------------------------------------------
+
+#define ASSERT_OFFSET(x, offset) _ASSERT( ((BYTE*)&pWOZ->x - (BYTE*)pWOZ) == offset )
+
+extern TCHAR VERSIONSTRING[];	// AppleWin.h
+
+BYTE* CWOZHelper::CreateEmptyDisk(DWORD& size)
+{
+	WOZEmptyImage525* pWOZ = new WOZEmptyImage525;
+	memset(pWOZ, 0, sizeof(WOZEmptyImage525));
+	size = sizeof(WOZEmptyImage525);
+	_ASSERT(size == 3*BLOCK_SIZE);
+
+	pWOZ->hdr.id1 = ID1_WOZ2;
+	pWOZ->hdr.id2 = ID2;
+	// hdr.crc32 done at end
+
+	// INFO
+	ASSERT_OFFSET(infoHdr, 12);
+	pWOZ->infoHdr.id = INFO_CHUNK_ID;
+	pWOZ->infoHdr.size = (BYTE*)&pWOZ->tmapHdr - (BYTE*)&pWOZ->info;
+	_ASSERT(pWOZ->infoHdr.size == INFO_CHUNK_SIZE);
+	pWOZ->info.v1.version = 2;
+	pWOZ->info.v1.diskType = InfoChunk::diskType5_25;
+	pWOZ->info.v1.cleaned = 1;
+	std::string creator("AppleWin v");
+	creator += std::string(VERSIONSTRING);
+	memset(&pWOZ->info.v1.creator[0], ' ', sizeof(pWOZ->info.v1.creator));
+	memcpy(&pWOZ->info.v1.creator[0], creator.c_str(), creator.size());	// don't include null
+	pWOZ->info.diskSides = 1;
+	pWOZ->info.bootSectorFormat = bootUnknown;	// could be INIT'd to 13 or 16 sector
+	pWOZ->info.optimalBitTiming = InfoChunkv2::optimalBitTiming5_25;
+	pWOZ->info.compatibleHardware = 0;	// unknown
+	pWOZ->info.requiredRAM = 0;			// unknown
+	pWOZ->info.largestTrack = TRK_DEFAULT_BLOCK_COUNT_5_25;		// unknown - but use default
+
+	// TMAP
+	ASSERT_OFFSET(tmapHdr, 80);
+	pWOZ->tmapHdr.id = TMAP_CHUNK_ID;
+	pWOZ->tmapHdr.size = sizeof(pWOZ->tmap);
+	memset(&pWOZ->tmap, TMAP_TRACK_EMPTY, sizeof(pWOZ->tmap));	// all tracks empty
+
+	// TRKS
+	ASSERT_OFFSET(trksHdr, 248);
+	pWOZ->trksHdr.id = TRKS_CHUNK_ID;
+	pWOZ->trksHdr.size = sizeof(pWOZ->trks);
+	for (UINT i = 0; i < sizeof(pWOZ->trks.trks) / sizeof(pWOZ->trks.trks[0]); i++)
+	{
+		pWOZ->trks.trks[i].startBlock = 0;	// minimum startBlock (at end of file!)
+		pWOZ->trks.trks[i].blockCount = 0;
+		pWOZ->trks.trks[i].bitCount = 0;
+	}
+
+	pWOZ->hdr.crc32 = crc32(0, (BYTE*)&pWOZ->infoHdr, sizeof(WOZEmptyImage525) - sizeof(WOZHeader));
+	return (BYTE*) pWOZ;
+}
+
+#if _DEBUG
+// Replace the call in CheckNormalFile() to CreateEmptyDiskv1() to generate a WOZv1 empty image-file
+BYTE* CWOZHelper::CreateEmptyDiskv1(DWORD& size)
+{
+	WOZv1EmptyImage525* pWOZ = new WOZv1EmptyImage525;
+	memset(pWOZ, 0, sizeof(WOZv1EmptyImage525));
+	size = sizeof(WOZv1EmptyImage525);
+	_ASSERT(size == 256);
+
+	pWOZ->hdr.id1 = ID1_WOZ1;
+	pWOZ->hdr.id2 = ID2;
+	// hdr.crc32 done at end
+
+	// INFO
+	ASSERT_OFFSET(infoHdr, 12);
+	pWOZ->infoHdr.id = INFO_CHUNK_ID;
+	pWOZ->infoHdr.size = (BYTE*)&pWOZ->tmapHdr - (BYTE*)&pWOZ->info;
+	_ASSERT(pWOZ->infoHdr.size == INFO_CHUNK_SIZE);
+	pWOZ->info.version = 1;
+	pWOZ->info.diskType = InfoChunk::diskType5_25;
+	pWOZ->info.cleaned = 1;
+	std::string creator("AppleWin v");
+	creator += std::string(VERSIONSTRING);
+	memset(&pWOZ->info.creator[0], ' ', sizeof(pWOZ->info.creator));
+	memcpy(&pWOZ->info.creator[0], creator.c_str(), creator.size());	// don't include null
+
+	// TMAP
+	ASSERT_OFFSET(tmapHdr, 80);
+	pWOZ->tmapHdr.id = TMAP_CHUNK_ID;
+	pWOZ->tmapHdr.size = sizeof(pWOZ->tmap);
+	memset(&pWOZ->tmap, TMAP_TRACK_EMPTY, sizeof(pWOZ->tmap));	// all tracks empty
+
+	// TRKS
+	ASSERT_OFFSET(trksHdr, 248);
+	pWOZ->trksHdr.id = TRKS_CHUNK_ID;
+	pWOZ->trksHdr.size = 0;
+
+	pWOZ->hdr.crc32 = crc32(0, (BYTE*)&pWOZ->infoHdr, sizeof(WOZv1EmptyImage525) - sizeof(WOZHeader));
+	return (BYTE*) pWOZ;
+}
+#endif

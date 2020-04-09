@@ -52,7 +52,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 		,"A2_DOS33.SYM"
 		,"A2_PRODOS.SYM"
 	};
-	char      g_sFileNameSymbolsUser [ MAX_PATH ] = "";
+	std::string  g_sFileNameSymbolsUser;
 
 	char * g_aSymbolTableNames[ NUM_SYMBOL_TABLES ] =
 	{
@@ -84,7 +84,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 //===========================================================================
 void _PrintCurrentPath()
 {
-	ConsoleDisplayError( g_sProgramDir );
+	ConsoleDisplayError( g_sProgramDir.c_str() );
 }
 
 Update_t _PrintSymbolInvalidTable()
@@ -551,7 +551,7 @@ Update_t _CmdSymbolsListTables (int nArgs, int bSymbolTables )
 
 
 //===========================================================================
-int ParseSymbolTable( TCHAR *pPathFileName, SymbolTable_Index_e eSymbolTableWrite, int nSymbolOffset )
+int ParseSymbolTable(const std::string & pPathFileName, SymbolTable_Index_e eSymbolTableWrite, int nSymbolOffset )
 {
 	char sText[ CONSOLE_WIDTH * 3 ];
 	bool bFileDisplayed = false;
@@ -560,7 +560,7 @@ int ParseSymbolTable( TCHAR *pPathFileName, SymbolTable_Index_e eSymbolTableWrit
 
 	int nSymbolsLoaded = 0;
 
-	if (! pPathFileName)
+	if (pPathFileName.empty())
 		return nSymbolsLoaded;
 
 //#if _UNICODE
@@ -574,7 +574,7 @@ int ParseSymbolTable( TCHAR *pPathFileName, SymbolTable_Index_e eSymbolTableWrit
 	sprintf( sFormat1, "%%x %%%ds", MAX_SYMBOLS_LEN ); // i.e. "%x %13s"
 	sprintf( sFormat2, "%%%ds %%x", MAX_SYMBOLS_LEN ); // i.e. "%13s %x"
 
-	FILE *hFile = fopen( pPathFileName, "rt" );
+	FILE *hFile = fopen( pPathFileName.c_str(), "rt" );
 
 	if( !hFile && g_bSymbolsDisplayMissingFile )
 	{
@@ -622,10 +622,13 @@ int ParseSymbolTable( TCHAR *pPathFileName, SymbolTable_Index_e eSymbolTableWrit
 				p = strstr(szLine, ";");		// Optional
 				if(p) *p = 0;
 				p = strstr(szLine, " ");		// 1st space between name & value
-				int nLen = p - szLine;
-				if (nLen > MAX_SYMBOLS_LEN)
+				if (p)
 				{
-					memset(&szLine[MAX_SYMBOLS_LEN], ' ', nLen-MAX_SYMBOLS_LEN);	// sscanf fails for nAddress if string too long
+					int nLen = p - szLine;
+					if (nLen > MAX_SYMBOLS_LEN)
+					{
+						memset(&szLine[MAX_SYMBOLS_LEN], ' ', nLen - MAX_SYMBOLS_LEN);	// sscanf fails for nAddress if string too long
+					}
 				}
 				sscanf(szLine, sFormat2, sName, &nAddress);
 			}
@@ -665,7 +668,7 @@ int ParseSymbolTable( TCHAR *pPathFileName, SymbolTable_Index_e eSymbolTableWrit
 					// TODO: Must check for buffer overflow !
 					ConsolePrintFormat( sText, "%s%s"
 						, CHC_PATH
-						, pPathFileName
+						, pPathFileName.c_str()
 					);
 				}
 
@@ -721,7 +724,7 @@ int ParseSymbolTable( TCHAR *pPathFileName, SymbolTable_Index_e eSymbolTableWrit
 						, CHC_STRING
 						, g_aSymbolTableNames[ iTable ]
 						, CHC_DEFAULT
-						, pPathFileName
+						, pPathFileName.c_str()
 					);
 				}
 
@@ -749,8 +752,7 @@ int ParseSymbolTable( TCHAR *pPathFileName, SymbolTable_Index_e eSymbolTableWrit
 //===========================================================================
 Update_t CmdSymbolsLoad (int nArgs)
 {
-	TCHAR sFileName[MAX_PATH];
-	_tcscpy(sFileName,g_sProgramDir);
+	std::string sFileName = g_sProgramDir;
 
 	int iSymbolTable = GetSymbolTableFromCommand();
 	if ((iSymbolTable < 0) || (iSymbolTable >= NUM_SYMBOL_TABLES))
@@ -763,24 +765,23 @@ Update_t CmdSymbolsLoad (int nArgs)
 	// Debugger will call us with 0 args on startup as a way to pre-load symbol tables
 	if (! nArgs)
 	{
-		_tcscat(sFileName, g_sFileNameSymbols[ iSymbolTable ]);
+		sFileName += g_sFileNameSymbols[ iSymbolTable ];
 		nSymbols = ParseSymbolTable( sFileName, (SymbolTable_Index_e) iSymbolTable );
 	}
 
 	int iArg = 1;
 	if (iArg <= nArgs)
 	{
-		TCHAR *pFileName = NULL;
+		std::string pFileName;
 		
 		if( g_aArgs[ iArg ].bType & TYPE_QUOTED_2 )
 		{
 			pFileName = g_aArgs[ iArg ].sArg;
 
-			_tcscpy(sFileName,g_sProgramDir);
-			_tcscat(sFileName, pFileName);
+			sFileName = g_sProgramDir + pFileName;
 
 			// Remember File Name of last symbols loaded
-			_tcscpy( g_sFileNameSymbolsUser, pFileName );
+			g_sFileNameSymbolsUser = pFileName;
 		}
 
 		// SymbolOffset
@@ -804,7 +805,7 @@ Update_t CmdSymbolsLoad (int nArgs)
 			}
 		}
 
-		if( pFileName )
+		if( !pFileName.empty() )
 		{
 			nSymbols = ParseSymbolTable( sFileName, (SymbolTable_Index_e) iSymbolTable, nOffsetAddr );
 		}

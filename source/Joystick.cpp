@@ -111,6 +111,15 @@ static UINT g_bJoyportEnabled = 0;	// Set to use Joyport to drive the 3 button i
 static UINT g_uJoyportActiveStick = 0;
 static UINT g_uJoyportReadMode = JOYPORT_LEFTRIGHT;
 
+static bool g_bHookAltKeys = true;
+
+//===========================================================================
+
+void JoySetHookAltKeys(bool hook)
+{
+	g_bHookAltKeys = hook;
+}
+
 //===========================================================================
 void CheckJoystick0()
 {
@@ -294,9 +303,20 @@ void JoyInitialize()
 
 //===========================================================================
 
+static UINT g_buttonVirtKey[2] = { VK_MENU, VK_MENU | KF_EXTENDED };	// VK_MENU == ALT Key
+
+void JoySetButtonVirtualKey(UINT button, UINT virtKey)
+{
+	_ASSERT(button < 2);
+	if (button >= 2) return;
+	g_buttonVirtKey[button] = virtKey;
+}
+
+//===========================================================================
+
 #define SUPPORT_CURSOR_KEYS
 
-BOOL JoyProcessKey(int virtkey, BOOL extended, BOOL down, BOOL autorep)
+BOOL JoyProcessKey(int virtkey, bool extended, bool down, bool autorep)
 {
 	static struct
 	{
@@ -306,23 +326,34 @@ BOOL JoyProcessKey(int virtkey, BOOL extended, BOOL down, BOOL autorep)
 		UINT32 Down:1;
 	} CursorKeys = {0};
 
+	const UINT virtKeyWithExtended = ((UINT)virtkey) | (extended ? KF_EXTENDED : 0);
+
 	if ( (joyinfo[joytype[0]] != DEVICE_KEYBOARD) &&
 		 (joyinfo[joytype[1]] != DEVICE_KEYBOARD) &&
-		 (virtkey != VK_MENU)								// VK_MENU == ALT Key
-	   )
+		 (virtKeyWithExtended != g_buttonVirtKey[0]) &&
+		 (virtKeyWithExtended != g_buttonVirtKey[1]) )
 	{
 		return 0;
 	}
+
+	if (!g_bHookAltKeys && virtkey == VK_MENU)				// GH#583
+		return 0;
 
 	//
 
 	BOOL keychange = 0;
 	bool bIsCursorKey = false;
+	const bool swapButtons0and1 = sg_PropertySheet.GetButtonsSwapState();
 
-	if (virtkey == VK_MENU)	// VK_MENU == ALT Key (Button #0 or #1)
+	if (virtKeyWithExtended == g_buttonVirtKey[!swapButtons0and1 ? 0 : 1])
 	{
 		keychange = 1;
-		keydown[JK_OPENAPPLE+(extended != 0)] = down;
+		keydown[JK_OPENAPPLE] = down;
+	}
+	else if (virtKeyWithExtended == g_buttonVirtKey[!swapButtons0and1 ? 1 : 0])
+	{
+		keychange = 1;
+		keydown[JK_CLOSEDAPPLE] = down;
 	}
 	else if (!extended)
 	{
@@ -631,7 +662,7 @@ void JoyReset()
 }
 
 //===========================================================================
-BYTE __stdcall JoyResetPosition(WORD, WORD, BYTE, BYTE, ULONG nExecutedCycles)
+void JoyResetPosition(ULONG nExecutedCycles)
 {
 	CpuCalcCycles(nExecutedCycles);
 	g_nJoyCntrResetCycle = g_nCumulativeCycles;
@@ -640,8 +671,6 @@ BYTE __stdcall JoyResetPosition(WORD, WORD, BYTE, BYTE, ULONG nExecutedCycles)
 		CheckJoystick0();
 	if((joyinfo[joytype[1]] == DEVICE_JOYSTICK) || (joyinfo[joytype[1]] == DEVICE_JOYSTICK_THUMBSTICK2))
 		CheckJoystick1();
-
-	return MemReadFloatingBus(nExecutedCycles);
 }
 
 //===========================================================================
@@ -918,13 +947,6 @@ void JoyportControl(const UINT uControl)
 }
 
 //===========================================================================
-
-void JoySetSnapshot_v1(const unsigned __int64 JoyCntrResetCycle)
-{
-	g_nJoyCntrResetCycle = JoyCntrResetCycle;
-}
-
-//
 
 #define SS_YAML_KEY_COUNTERRESETCYCLE "Counter Reset Cycle"
 #define SS_YAML_KEY_JOY0TRIMX "Joystick0 TrimX"

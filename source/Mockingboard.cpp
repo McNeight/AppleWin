@@ -80,6 +80,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #include "SaveState_Structs_v1.h"
 
 #include "Applewin.h"
+#include "CardManager.h"
 #include "CPU.h"
 #include "Log.h"
 #include "Memory.h"
@@ -127,7 +128,12 @@ struct SY6522_AY8910
 	bool bTimer1Active;
 	bool bTimer2Active;
 	SSI263A SpeechChip;
-	MockingboardUnitState_e state;	// Where a unit is a 6522+AY8910 pair (or for Phasor: 6522+2xAY8910)
+	MockingboardUnitState_e state;	// Where a unit is a 6522+AY8910 pair
+	MockingboardUnitState_e stateB;	// Phasor: 6522 & 2nd AY8910
+
+	// NB. No need to save to save-state, as it will be done immediately after opcode completes in MB_UpdateCycles()
+	bool bLoadT1C;					// Load T1C with T1L after opcode completes
+	bool bLoadT2C;					// Load T2C with T2L after opcode completes
 };
 
 
@@ -155,7 +161,6 @@ struct SY6522_AY8910
 static SY6522_AY8910 g_MB[NUM_AY8910];
 
 // Timer vars
-static ULONG g_n6522TimerPeriod = 0;
 static const UINT kTIMERDEVICE_INVALID = -1;
 static UINT g_nMBTimerDevice = kTIMERDEVICE_INVALID;	// SY6522 device# which is generating timer IRQ
 static UINT64 g_uLastCumulativeCycles = 0;
@@ -204,18 +209,16 @@ static const int g_nNumEvents = 2;
 static HANDLE g_hSSI263Event[g_nNumEvents] = {NULL};	// 1: Phoneme finished playing, 2: Exit thread
 static DWORD g_dwMaxPhonemeLen = 0;
 
-// When 6522 IRQ is *not* active use 60Hz update freq for MB voices
-static const double g_f6522TimerPeriod_NoIRQ = CLK_6502 / 60.0;		// Constant whatever the CLK is set to
-
 static bool g_bCritSectionValid = false;	// Deleting CritialSection when not valid causes crash on Win98
 static CRITICAL_SECTION g_CriticalSection;	// To guard 6522's IFR
+
+static UINT g_cyclesThisAudioFrame = 0;
 
 //---------------------------------------------------------------------------
 
 // Forward refs:
 static DWORD WINAPI SSI263Thread(LPVOID);
 static void Votrax_Write(BYTE nDevice, BYTE nValue);
-static double MB_GetFramePeriod(void);
 
 //---------------------------------------------------------------------------
 
@@ -223,12 +226,9 @@ static void StartTimer1(SY6522_AY8910* pMB)
 {
 	pMB->bTimer1Active = true;
 
-	// 6522 CLK runs at same speed as 6502 CLK
-	g_n6522TimerPeriod = pMB->sy6522.TIMER1_LATCH.w;
-
 	if (pMB->sy6522.IER & IxR_TIMER1)			// Using 6522 interrupt
 		g_nMBTimerDevice = pMB->nAY8910Number;
-	else if (pMB->sy6522.ACR & RM_FREERUNNING)	// Polling 6522 IFR
+	else if (pMB->sy6522.ACR & RM_FREERUNNING)	// Polling 6522 IFR (GH#496)
 		g_nMBTimerDevice = pMB->nAY8910Number;
 }
 
@@ -240,10 +240,6 @@ static void StartTimer1_LoadStateV1(SY6522_AY8910* pMB)
 		return;
 
 	pMB->bTimer1Active = true;
-
-	// 6522 CLK runs at same speed as 6502 CLK
-	g_n6522TimerPeriod = pMB->sy6522.TIMER1_LATCH.w;
-
 	g_nMBTimerDevice = pMB->nAY8910Number;
 }
 
@@ -279,11 +275,12 @@ static void ResetSY6522(SY6522_AY8910* pMB)
 
 	pMB->nAYCurrentRegister = 0;
 	pMB->state = AY_INACTIVE;
+	pMB->stateB = AY_INACTIVE;
 }
 
 //-----------------------------------------------------------------------------
 
-static void AY8910_Write(BYTE nDevice, BYTE nReg, BYTE nValue, BYTE nAYDevice)
+static void AY8910_Write(BYTE nDevice, BYTE /*nReg*/, BYTE nValue, BYTE nAYDevice)
 {
 	g_bMB_RegAccessedFlag = true;
 	SY6522_AY8910* pMB = &g_MB[nDevice];
@@ -301,8 +298,16 @@ static void AY8910_Write(BYTE nDevice, BYTE nReg, BYTE nValue, BYTE nAYDevice)
 		int nBC1 = nValue & 1;
 
 		MockingboardUnitState_e nAYFunc = (MockingboardUnitState_e) ((nBDIR<<2) | (nBC2<<1) | nBC1);
+		MockingboardUnitState_e& state = (nAYDevice == 0) ? pMB->state : pMB->stateB;	// GH#659
 
-		if (pMB->state == AY_INACTIVE)	// GH#320: functions only work from inactive state
+#if _DEBUG
+		if (!g_bPhasorEnable)
+			_ASSERT(nAYDevice == 0);
+		if (nAYFunc == AY_WRITE || nAYFunc == AY_LATCH)
+			_ASSERT(state == AY_INACTIVE);
+#endif
+
+		if (state == AY_INACTIVE)	// GH#320: functions only work from inactive state
 		{
 			switch (nAYFunc)
 			{
@@ -328,7 +333,7 @@ static void AY8910_Write(BYTE nDevice, BYTE nReg, BYTE nValue, BYTE nAYDevice)
 			}
 		}
 
-		pMB->state = nAYFunc;
+		state = nAYFunc;
 	}
 }
 
@@ -424,9 +429,10 @@ static void SY6522_Write(BYTE nDevice, BYTE nReg, BYTE nValue)
 			UpdateIFR(pMB, IxR_TIMER1);
 
 			pMB->sy6522.TIMER1_LATCH.h = nValue;
-			pMB->sy6522.TIMER1_COUNTER.w = pMB->sy6522.TIMER1_LATCH.w;
+			pMB->bLoadT1C = true;
 
 			StartTimer1(pMB);
+			CpuAdjustIrqCheck(pMB->sy6522.TIMER1_LATCH.w);	// Sync IRQ check timeout with 6522 counter underflow - GH#608
 			break;
 		case 0x07:	// TIMER1H_LATCH
 			// Clear Timer1 Interrupt Flag.
@@ -440,10 +446,11 @@ static void SY6522_Write(BYTE nDevice, BYTE nReg, BYTE nValue)
 			// Clear Timer2 Interrupt Flag.
 			UpdateIFR(pMB, IxR_TIMER2);
 
-			pMB->sy6522.TIMER2_LATCH.h = nValue;
+			pMB->sy6522.TIMER2_LATCH.h = nValue;			// NB. Real 6522 doesn't have TIMER2_LATCH.h
 			pMB->sy6522.TIMER2_COUNTER.w = pMB->sy6522.TIMER2_LATCH.w;
 
 			StartTimer2(pMB);
+			CpuAdjustIrqCheck(pMB->sy6522.TIMER2_LATCH.w);	// Sync IRQ check timeout with 6522 counter underflow - GH#608
 			break;
 		case 0x0a:	// SERIAL_SHIFT
 			break;
@@ -464,29 +471,14 @@ static void SY6522_Write(BYTE nDevice, BYTE nReg, BYTE nValue)
 				// Clear those bits which are set in the lower 7 bits.
 				nValue ^= 0x7F;
 				pMB->sy6522.IER &= nValue;
-				UpdateIFR(pMB, 0);
-				
-				// Check if active timer has been disabled:
-				if (((pMB->sy6522.IER & IxR_TIMER1) == 0) && pMB->bTimer1Active)
-					StopTimer1(pMB);
-
-				if (((pMB->sy6522.IER & IxR_TIMER2) == 0) && pMB->bTimer2Active)
-					StopTimer2(pMB);
 			}
 			else
 			{
 				// Set those bits which are set in the lower 7 bits.
 				nValue &= 0x7F;
 				pMB->sy6522.IER |= nValue;
-				UpdateIFR(pMB, 0);
-
-				// Check if a timer interrupt has been enabled (regardless of if there's an active timer or not): GH#567
-				if (pMB->sy6522.IER & IxR_TIMER1)
-					StartTimer1(pMB);
-
-				if (pMB->sy6522.IER & IxR_TIMER2)
-					StartTimer2(pMB);
 			}
+			UpdateIFR(pMB, 0);
 			break;
 		case 0x0f:	// ORA_NO_HS
 			break;
@@ -518,7 +510,8 @@ static BYTE SY6522_Read(BYTE nDevice, BYTE nReg)
 			nValue = pMB->sy6522.DDRA;
 			break;
 		case 0x04:	// TIMER1L_COUNTER
-			nValue = pMB->sy6522.TIMER1_COUNTER.l;
+			// NB. GH#701 (T1C:=0xFFFF, LDA T1C_L, A==0xFC)
+			nValue = (pMB->sy6522.TIMER1_COUNTER.w - 3) & 0xff;		// -3 to compensate for the (assumed) 4-cycle STA 6522.T1C_H
 			UpdateIFR(pMB, IxR_TIMER1);
 			break;
 		case 0x05:	// TIMER1H_COUNTER
@@ -619,14 +612,11 @@ static void SSI263_Write(BYTE nDevice, BYTE nReg, BYTE nValue)
 #endif
 
 		// Datasheet is not clear, but a write to DURPHON must clear the IRQ
-		if(g_bPhasorEnable)
-		{
-		    CpuIrqDeassert(IS_SPEECH);
-		}
-		else
-		{
+		if (pMB->sy6522.PCR == 0x0C)
 			UpdateIFR(pMB, IxR_PERIPHERAL);
-		}
+		else	// Phasor's SSI263.IRQ line appears to be wired directly to IRQ (Bypassing the 6522)
+			CpuIrqDeassert(IS_SPEECH);
+
 		pMB->SpeechChip.CurrentMode &= ~1;	// Clear SSI263's D7 pin
 
 		pMB->SpeechChip.DurationPhoneme = nValue;
@@ -634,15 +624,7 @@ static void SSI263_Write(BYTE nDevice, BYTE nReg, BYTE nValue)
 		g_nSSI263Device = nDevice;
 
 		// Phoneme output not dependent on CONTROL bit
-		if(g_bPhasorEnable)
-		{
-			if(nValue || (g_nCurrentActivePhoneme<0))
-				SSI263_Play(nValue & PHONEME_MASK);
-		}
-		else
-		{
-			SSI263_Play(nValue & PHONEME_MASK);
-		}
+		SSI263_Play(nValue & PHONEME_MASK);
 		break;
 	case SSI_INFLECT:
 #if LOG_SSI263
@@ -763,13 +745,14 @@ static void Votrax_Write(BYTE nDevice, BYTE nValue)
 
 //===========================================================================
 
+//#define DBG_MB_UPDATE
+static UINT64 g_uLastMBUpdateCycle = 0;
+
 // Called by:
 // . MB_UpdateCycles()    - when g_nMBTimerDevice == {0,1,2,3}
-// . MB_EndOfVideoFrame() - when g_nMBTimerDevice == kTIMERDEVICE_INVALID
-static void MB_Update()
+// . MB_PeriodicUpdate()  - when g_nMBTimerDevice == kTIMERDEVICE_INVALID
+static void MB_Update(void)
 {
-	//char szDbg[200];
-
 	if (!MockingboardVoice.bActive)
 		return;
 
@@ -812,18 +795,35 @@ static void MB_Update()
 
 	//
 
-	static DWORD dwByteOffset = (DWORD)-1;
-	static int nNumSamplesError = 0;
+	// For small timer periods, wait for a period of 500cy before updating DirectSound ring-buffer.
+	// NB. A timer period of less than 24cy will yield nNumSamplesPerPeriod=0.
+	const double kMinimumUpdateInterval = 500.0;	// Arbitary (500 cycles = 21 samples)
+	const double kMaximumUpdateInterval = (double)(0xFFFF+2);	// Max 6522 timer interval (2756 samples)
 
-	const double n6522TimerPeriod = MB_GetFramePeriod();
+	if (g_uLastMBUpdateCycle == 0)
+		g_uLastMBUpdateCycle = g_uLastCumulativeCycles;		// Initial call to MB_Update() after reset/power-cycle
 
-	const double nIrqFreq = g_fCurrentCLK6502 / n6522TimerPeriod + 0.5;			// Round-up
+	_ASSERT(g_uLastCumulativeCycles >= g_uLastMBUpdateCycle);
+	double updateInterval = (double)(g_uLastCumulativeCycles - g_uLastMBUpdateCycle);
+	if (updateInterval < kMinimumUpdateInterval)
+		return;
+	if (updateInterval > kMaximumUpdateInterval)
+		updateInterval = kMaximumUpdateInterval;
+
+	g_uLastMBUpdateCycle = g_uLastCumulativeCycles;
+
+	const double nIrqFreq = g_fCurrentCLK6502 / updateInterval + 0.5;			// Round-up
 	const int nNumSamplesPerPeriod = (int) ((double)SAMPLE_RATE / nIrqFreq);	// Eg. For 60Hz this is 735
+
+	static int nNumSamplesError = 0;
 	int nNumSamples = nNumSamplesPerPeriod + nNumSamplesError;					// Apply correction
 	if(nNumSamples <= 0)
 		nNumSamples = 0;
 	if(nNumSamples > 2*nNumSamplesPerPeriod)
 		nNumSamples = 2*nNumSamplesPerPeriod;
+
+	if (nNumSamples > SAMPLE_RATE)
+		nNumSamples = SAMPLE_RATE;	// Clamp to prevent buffer overflow (bufferSize = SAMPLE_RATE)
 
 	if(nNumSamples)
 		for(int nChip=0; nChip<NUM_AY8910; nChip++)
@@ -831,14 +831,12 @@ static void MB_Update()
 
 	//
 
-	DWORD dwDSLockedBufferSize0, dwDSLockedBufferSize1;
-	SHORT *pDSLockedBuffer0, *pDSLockedBuffer1;
-
 	DWORD dwCurrentPlayCursor, dwCurrentWriteCursor;
 	HRESULT hr = MockingboardVoice.lpDSBvoice->GetCurrentPosition(&dwCurrentPlayCursor, &dwCurrentWriteCursor);
 	if(FAILED(hr))
 		return;
 
+	static DWORD dwByteOffset = (DWORD)-1;
 	if(dwByteOffset == (DWORD)-1)
 	{
 		// First time in this func
@@ -854,12 +852,12 @@ static void MB_Update()
 			// |-----PxxxxxW-----|
 			if((dwByteOffset > dwCurrentPlayCursor) && (dwByteOffset < dwCurrentWriteCursor))
 			{
+#ifdef DBG_MB_UPDATE
 				double fTicksSecs = (double)GetTickCount() / 1000.0;
-				//sprintf(szDbg, "%010.3f: [MBUpdt]    PC=%08X, WC=%08X, Diff=%08X, Off=%08X, NS=%08X xxx\n", fTicksSecs, dwCurrentPlayCursor, dwCurrentWriteCursor, dwCurrentWriteCursor-dwCurrentPlayCursor, dwByteOffset, nNumSamples);
-				//OutputDebugString(szDbg);
-				//if (g_fh) fprintf(g_fh, "%s", szDbg);
-
+				LogOutput("%010.3f: [MBUpdt]    PC=%08X, WC=%08X, Diff=%08X, Off=%08X, NS=%08X xxx\n", fTicksSecs, dwCurrentPlayCursor, dwCurrentWriteCursor, dwCurrentWriteCursor-dwCurrentPlayCursor, dwByteOffset, nNumSamples);
+#endif
 				dwByteOffset = dwCurrentWriteCursor;
+				nNumSamplesError = 0;
 			}
 		}
 		else
@@ -867,12 +865,12 @@ static void MB_Update()
 			// |xxW----------Pxxx|
 			if((dwByteOffset > dwCurrentPlayCursor) || (dwByteOffset < dwCurrentWriteCursor))
 			{
+#ifdef DBG_MB_UPDATE
 				double fTicksSecs = (double)GetTickCount() / 1000.0;
-				//sprintf(szDbg, "%010.3f: [MBUpdt]    PC=%08X, WC=%08X, Diff=%08X, Off=%08X, NS=%08X XXX\n", fTicksSecs, dwCurrentPlayCursor, dwCurrentWriteCursor, dwCurrentWriteCursor-dwCurrentPlayCursor, dwByteOffset, nNumSamples);
-				//OutputDebugString(szDbg);
-				//if (g_fh) fprintf(g_fh, "%s", szDbg);
-
+				LogOutput("%010.3f: [MBUpdt]    PC=%08X, WC=%08X, Diff=%08X, Off=%08X, NS=%08X XXX\n", fTicksSecs, dwCurrentPlayCursor, dwCurrentWriteCursor, dwCurrentWriteCursor-dwCurrentPlayCursor, dwByteOffset, nNumSamples);
+#endif
 				dwByteOffset = dwCurrentWriteCursor;
+				nNumSamplesError = 0;
 			}
 		}
 	}
@@ -889,6 +887,11 @@ static void MB_Update()
 		nNumSamplesError -= nErrorInc;				// > 0.50 of buffer remaining
 	else
 		nNumSamplesError = 0;						// Acceptable amount of data in buffer
+
+#ifdef DBG_MB_UPDATE
+	double fTicksSecs = (double)GetTickCount() / 1000.0;
+	LogOutput("%010.3f: [MBUpdt]    PC=%08X, WC=%08X, Diff=%08X, Off=%08X, NS=%08X, NSE=%08X, Interval=%f\n", fTicksSecs, dwCurrentPlayCursor, dwCurrentWriteCursor, dwCurrentWriteCursor - dwCurrentPlayCursor, dwByteOffset, nNumSamples, nNumSamplesError, updateInterval);
+#endif
 
 	if(nNumSamples == 0)
 		return;
@@ -930,6 +933,9 @@ static void MB_Update()
 	}
 
 	//
+
+	DWORD dwDSLockedBufferSize0, dwDSLockedBufferSize1;
+	SHORT *pDSLockedBuffer0, *pDSLockedBuffer1;
 
 	if(!DSGetLock(MockingboardVoice.lpDSBvoice,
 						dwByteOffset, (DWORD)nNumSamples*sizeof(short)*g_nMB_NumChannels,
@@ -990,28 +996,19 @@ static DWORD WINAPI SSI263Thread(LPVOID lpParameter)
 		// Phoneme complete, so generate IRQ if necessary
 		SY6522_AY8910* pMB = &g_MB[g_nSSI263Device];
 
-		if(g_bPhasorEnable)
+		if (!g_bVotraxPhoneme && pMB->SpeechChip.CurrentMode != MODE_IRQ_DISABLED)
 		{
-			if((pMB->SpeechChip.CurrentMode != MODE_IRQ_DISABLED))
-			{
 				pMB->SpeechChip.CurrentMode |= 1;	// Set SSI263's D7 pin
 
-				// Phasor's SSI263.IRQ line appears to be wired directly to IRQ (Bypassing the 6522)
-				CpuIrqAssert(IS_SPEECH);
-			}
-		}
-		else
-		{
-			if((pMB->SpeechChip.CurrentMode != MODE_IRQ_DISABLED) && (pMB->sy6522.PCR == 0x0C))
-			{
-				UpdateIFR(pMB, 0, IxR_PERIPHERAL);
-				pMB->SpeechChip.CurrentMode |= 1;	// Set SSI263's D7 pin
-			}
+				if (pMB->sy6522.PCR == 0x0C)
+					UpdateIFR(pMB, 0, IxR_PERIPHERAL);
+				else	// Phasor's SSI263.IRQ line appears to be wired directly to IRQ (Bypassing the 6522)
+					CpuIrqAssert(IS_SPEECH);
 		}
 
 		//
 
-		if(g_bVotraxPhoneme && (pMB->sy6522.PCR == 0xB0))
+		if (g_bVotraxPhoneme && pMB->sy6522.PCR == 0xB0)
 		{
 			// !A/R: Time-out of old phoneme (signal goes from low to high)
 
@@ -1374,13 +1371,20 @@ static void MB_DSUninit()
 
 //=============================================================================
 
+static void InitSoundcardType(void)
+{
+	g_SoundcardType = CT_Empty;	// Use CT_Empty to mean: no soundcard
+	g_bPhasorEnable = false;
+}
+
 void MB_Initialize()
 {
+	InitSoundcardType();
+
 	LogFileOutput("MB_Initialize: g_bDisableDirectSound=%d, g_bDisableDirectSoundMockingboard=%d\n", g_bDisableDirectSound, g_bDisableDirectSoundMockingboard);
 	if (g_bDisableDirectSound || g_bDisableDirectSoundMockingboard)
 	{
 		MockingboardVoice.bMute = true;
-		g_SoundcardType = CT_Empty;
 	}
 	else
 	{
@@ -1407,6 +1411,22 @@ void MB_Initialize()
 
 	InitializeCriticalSection(&g_CriticalSection);
 	g_bCritSectionValid = true;
+}
+
+void MB_SetSoundcardType(SS_CARDTYPE NewSoundcardType);
+
+// NB. Mockingboard voice is *already* muted because showing 'Select Load State file' dialog
+// . and voice will be demuted when dialog is closed
+void MB_InitializeForLoadingSnapshot()	// GH#609
+{
+	MB_Reset();
+	InitSoundcardType();
+
+	if (g_bDisableDirectSound || g_bDisableDirectSoundMockingboard)
+		return;
+
+	_ASSERT(MockingboardVoice.lpDSBvoice);
+	MockingboardVoice.lpDSBvoice->Stop();	// Reason: 'MB voice is playing' then loading a save-state where 'no MB present'
 }
 
 //-----------------------------------------------------------------------------
@@ -1438,9 +1458,8 @@ void MB_Destroy()
 
 static void ResetState()
 {
-	g_n6522TimerPeriod = 0;
 	g_nMBTimerDevice = kTIMERDEVICE_INVALID;
-	g_uLastCumulativeCycles = 0;
+	MB_SetCumulativeCycles();
 
 	g_nSSI263Device = 0;
 	g_nCurrentActivePhoneme = -1;
@@ -1451,15 +1470,19 @@ static void ResetState()
 	g_bMB_RegAccessedFlag = false;
 	g_bMB_Active = false;
 
-	//g_bMBAvailable = false;
-
-//	g_SoundcardType = CT_Empty;	// Don't uncomment, else _ASSERT will fire in MB_Read() after an F2->MB_Reset()
-//	g_bPhasorEnable = false;
 	g_nPhasorMode = 0;
 	g_PhasorClockScaleFactor = 1;
+
+	g_uLastMBUpdateCycle = 0;
+	g_cyclesThisAudioFrame = 0;
+
+	// Not these, as they don't change on a CTRL+RESET or power-cycle:
+//	g_bMBAvailable = false;
+//	g_SoundcardType = CT_Empty;	// Don't uncomment, else _ASSERT will fire in MB_Read() after an F2->MB_Reset()
+//	g_bPhasorEnable = false;
 }
 
-void MB_Reset()
+void MB_Reset()	// CTRL+RESET or power-cycle
 {
 	if(!g_bDSAvailable)
 		return;
@@ -1478,7 +1501,8 @@ void MB_Reset()
 
 static BYTE __stdcall MB_Read(WORD PC, WORD nAddr, BYTE bWrite, BYTE nValue, ULONG nExecutedCycles)
 {
-	MB_UpdateCycles(nExecutedCycles);
+	if (g_bFullSpeed)
+		MB_UpdateCycles(nExecutedCycles);
 
 #ifdef _DEBUG
 	if(!IS_APPLE2 && MemCheckINTCXROM())
@@ -1541,7 +1565,8 @@ static BYTE __stdcall MB_Read(WORD PC, WORD nAddr, BYTE bWrite, BYTE nValue, ULO
 
 static BYTE __stdcall MB_Write(WORD PC, WORD nAddr, BYTE bWrite, BYTE nValue, ULONG nExecutedCycles)
 {
-	MB_UpdateCycles(nExecutedCycles);
+	if (g_bFullSpeed)
+		MB_UpdateCycles(nExecutedCycles);
 
 #ifdef _DEBUG
 	if(!IS_APPLE2 && MemCheckINTCXROM())
@@ -1606,9 +1631,29 @@ static BYTE __stdcall PhasorIO(WORD PC, WORD nAddr, BYTE bWrite, BYTE nValue, UL
 
 	g_PhasorClockScaleFactor = (nAddr & 4) ? 2 : 1;
 
-	AY8910_InitClock((int)(CLK_6502 * g_PhasorClockScaleFactor));
+	AY8910_InitClock((int)(Get6502BaseClock() * g_PhasorClockScaleFactor));
 
 	return MemReadFloatingBus(nExecutedCycles);
+}
+
+//-----------------------------------------------------------------------------
+
+SS_CARDTYPE MB_GetSoundcardType()
+{
+	return g_SoundcardType;
+}
+
+static void MB_SetSoundcardType(const SS_CARDTYPE NewSoundcardType)
+{
+	if (NewSoundcardType == g_SoundcardType)
+		return;
+
+	if (NewSoundcardType == CT_Empty)
+		MB_Mute();	// Call MB_Mute() before setting g_SoundcardType = CT_Empty
+
+	g_SoundcardType = NewSoundcardType;
+
+	g_bPhasorEnable = (g_SoundcardType == CT_Phasor);
 }
 
 //-----------------------------------------------------------------------------
@@ -1619,21 +1664,30 @@ void MB_InitializeIO(LPBYTE pCxRomPeripheral, UINT uSlot4, UINT uSlot5)
 	// Phasor      : Slot 4
 	// <other>     : Slot 4 & 5
 
-	if (g_Slot4 != CT_MockingboardC && g_Slot4 != CT_Phasor)
+	if (g_CardMgr.QuerySlot(SLOT4) != CT_MockingboardC && g_CardMgr.QuerySlot(SLOT4) != CT_Phasor)
 	{
 		MB_SetSoundcardType(CT_Empty);
 		return;
 	}
 
-	if (g_Slot4 == CT_MockingboardC)
+	if (g_CardMgr.QuerySlot(SLOT4) == CT_MockingboardC)
 		RegisterIoHandler(uSlot4, IO_Null, IO_Null, MB_Read, MB_Write, NULL, NULL);
 	else	// Phasor
 		RegisterIoHandler(uSlot4, PhasorIO, PhasorIO, MB_Read, MB_Write, NULL, NULL);
 
-	if (g_Slot5 == CT_MockingboardC)
+	if (g_CardMgr.QuerySlot(SLOT5) == CT_MockingboardC)
 		RegisterIoHandler(uSlot5, IO_Null, IO_Null, MB_Read, MB_Write, NULL, NULL);
 
-	MB_SetSoundcardType(g_Slot4);
+	MB_SetSoundcardType(g_CardMgr.QuerySlot(SLOT4));
+
+	if (g_bDisableDirectSound || g_bDisableDirectSoundMockingboard)
+		return;
+
+	// Sound buffer may have been stopped by MB_InitializeForLoadingSnapshot().
+	// NB. DSZeroVoiceBuffer() also zeros the sound buffer, so it's better than directly calling IDirectSoundBuffer::Play():
+	// - without zeroing, then the previous sound buffer can be heard for a fraction of a second
+	// - eg. when doing Mockingboard playback, then loading a save-state which is also doing Mockingboard playback
+	DSZeroVoiceBuffer(&MockingboardVoice, "MB", g_dwDSBufferSize);
 }
 
 //-----------------------------------------------------------------------------
@@ -1672,52 +1726,121 @@ void MB_Demute()
 
 //-----------------------------------------------------------------------------
 
-// Called by CpuExecute() before doing CPU emulation
-void MB_StartOfCpuExecute()
-{
-	g_uLastCumulativeCycles = g_nCumulativeCycles;
-}
-
-// Called by ContinueExecution() at the end of every video frame
-void MB_EndOfVideoFrame()
+#ifdef _DEBUG
+void MB_CheckCumulativeCycles()
 {
 	if (g_SoundcardType == CT_Empty)
 		return;
 
-	if (g_nMBTimerDevice == kTIMERDEVICE_INVALID)
-		MB_Update();
+	_ASSERT(g_uLastCumulativeCycles == g_nCumulativeCycles);
+	g_uLastCumulativeCycles = g_nCumulativeCycles;
+}
+#endif
+
+// Called by: ResetState() and Snapshot_LoadState_v2()
+void MB_SetCumulativeCycles()
+{
+	g_uLastCumulativeCycles = g_nCumulativeCycles;
+}
+
+// Called by ContinueExecution() at the end of every execution period (~1000 cycles or ~3 cycle when MODE_STEPPING)
+// NB. Required for FT's TEST LAB #1 player
+void MB_PeriodicUpdate(UINT executedCycles)
+{
+	if (g_SoundcardType == CT_Empty)
+		return;
+
+	if (g_nMBTimerDevice != kTIMERDEVICE_INVALID)
+		return;
+
+	const UINT kCyclesPerAudioFrame = 1000;
+	g_cyclesThisAudioFrame += executedCycles;
+	if (g_cyclesThisAudioFrame < kCyclesPerAudioFrame)
+		return;
+
+	g_cyclesThisAudioFrame %= kCyclesPerAudioFrame;
+
+	MB_Update();
 }
 
 //-----------------------------------------------------------------------------
 
+static bool CheckTimerUnderflowAndIrq(USHORT& timerCounter, int& timerIrqDelay, const USHORT nClocks, bool* pTimerUnderflow=NULL)
+{
+	if (nClocks == 0)
+		return false;
+
+	int oldTimer = timerCounter;
+	int timer = timerCounter;
+	timer -= nClocks;
+	timerCounter = (USHORT)timer;
+
+	bool timerIrq = false;
+
+	if (timerIrqDelay)	// Deal with any previous counter underflow which didn't yet result in an IRQ
+	{
+		_ASSERT(timerIrqDelay == 1);
+		timerIrqDelay = 0;
+		timerIrq = true;
+		// if LATCH is very small then could underflow for every opcode...
+	}
+
+	if (oldTimer >= 0 && timer < 0)	// Underflow occurs for 0x0000 -> 0xFFFF
+	{
+		if (pTimerUnderflow)
+			*pTimerUnderflow = true;	// Just for Willy Byte!
+
+		if (timer <= -2)				// TIMER = 0xFFFE (or less)
+			timerIrq = true;
+		else							// TIMER = 0xFFFF
+			timerIrqDelay = 1;			// ...so 1 cycle until IRQ
+	}
+
+	return timerIrq;
+}
+
 // Called by:
 // . CpuExecute() every ~1000 @ 1MHz
-// . CheckInterruptSources() every 128 cycles
-// . MB_Read() / MB_Write()
-void MB_UpdateCycles(ULONG uExecutedCycles)
+// . CheckInterruptSources() every opcode (or every 40 opcodes at full-speed)
+// . MB_Read() / MB_Write() (only for full-speed)
+bool MB_UpdateCycles(ULONG uExecutedCycles)
 {
-	if(g_SoundcardType == CT_Empty)
-		return;
+	if (g_SoundcardType == CT_Empty)
+		return false;
 
 	CpuCalcCycles(uExecutedCycles);
 	UINT64 uCycles = g_nCumulativeCycles - g_uLastCumulativeCycles;
+	if (uCycles == 0)
+		return false;		// Likely when called from CpuExecute()
+
+	const bool isOpcode = (uCycles <= 7);		// todo: better to pass in a flag?
+
 	g_uLastCumulativeCycles = g_nCumulativeCycles;
 	_ASSERT(uCycles < 0x10000);
 	USHORT nClocks = (USHORT) uCycles;
 
-	for(int i=0; i<NUM_SY6522; i++)
+	bool bIrqOnLastOpcodeCycle = false;
+
+	for (int i=0; i<NUM_SY6522; i++)
 	{
 		SY6522_AY8910* pMB = &g_MB[i];
 
-		USHORT OldTimer1 = pMB->sy6522.TIMER1_COUNTER.w;
-		USHORT OldTimer2 = pMB->sy6522.TIMER2_COUNTER.w;
+		bool bTimer1Underflow = false;	// Just for Willy Byte!
+		bool bTimer1Irq = false;
+		bool bTimer1IrqOnLastCycle = false;
 
-		pMB->sy6522.TIMER1_COUNTER.w -= nClocks;
-		pMB->sy6522.TIMER2_COUNTER.w -= nClocks;
+		if (isOpcode)
+		{
+			bTimer1Irq = CheckTimerUnderflowAndIrq(pMB->sy6522.TIMER1_COUNTER.w, pMB->sy6522.timer1IrqDelay, nClocks-1, &bTimer1Underflow);
+			bTimer1IrqOnLastCycle  = CheckTimerUnderflowAndIrq(pMB->sy6522.TIMER1_COUNTER.w, pMB->sy6522.timer1IrqDelay, 1, &bTimer1Underflow);
+			bTimer1Irq = bTimer1Irq || bTimer1IrqOnLastCycle;
+		}
+		else
+		{
+			bTimer1Irq = CheckTimerUnderflowAndIrq(pMB->sy6522.TIMER1_COUNTER.w, pMB->sy6522.timer1IrqDelay, nClocks, &bTimer1Underflow);
+		}
 
-		// Check for counter underflow
-		bool bTimer1Underflow = (!(OldTimer1 & 0x8000) && (pMB->sy6522.TIMER1_COUNTER.w & 0x8000));
-		bool bTimer2Underflow = (!(OldTimer2 & 0x8000) && (pMB->sy6522.TIMER2_COUNTER.w & 0x8000));
+		const bool bTimer2Irq = CheckTimerUnderflowAndIrq(pMB->sy6522.TIMER2_COUNTER.w, pMB->sy6522.timer2IrqDelay, nClocks);
 
 		if (!pMB->bTimer1Active && bTimer1Underflow)
 		{
@@ -1727,19 +1850,19 @@ void MB_UpdateCycles(ULONG uExecutedCycles)
 			{
 				// Fix for Willy Byte - need to confirm that 6522 really does this!
 				// . It never accesses IER/IFR/TIMER1 regs to clear IRQ
+				// . NB. Willy Byte doesn't work with Phasor.
 				UpdateIFR(pMB, IxR_TIMER1);		// Deassert the TIMER IRQ
 			}
 		}
 
-		if (pMB->bTimer1Active && bTimer1Underflow)
+		if (pMB->bTimer1Active && bTimer1Irq)
 		{
 			UpdateIFR(pMB, 0, IxR_TIMER1);
+			bIrqOnLastOpcodeCycle = true;
 
-			// Do MB_Update() before StopTimer1()
-			if (g_nMBTimerDevice == i)
-				MB_Update();
+			MB_Update();
 
-			if((pMB->sy6522.ACR & RUNMODE) == RM_ONESHOT)
+			if ((pMB->sy6522.ACR & RUNMODE) == RM_ONESHOT)
 			{
 				// One-shot mode
 				// - Phasor's playback code uses one-shot mode
@@ -1750,70 +1873,41 @@ void MB_UpdateCycles(ULONG uExecutedCycles)
 			{
 				// Free-running mode
 				// - Ultima4/5 change ACCESS_TIMER1 after a couple of IRQs into tune
-				pMB->sy6522.TIMER1_COUNTER.w = pMB->sy6522.TIMER1_LATCH.w;
+				pMB->sy6522.TIMER1_COUNTER.w += pMB->sy6522.TIMER1_LATCH.w;	// GH#651: account for underflowed cycles too
+				pMB->sy6522.TIMER1_COUNTER.w += 2;							// GH#652: account for extra 2 cycles (Rockwell, Fig.16: period=N+2cycles)
+																			// EG. T1C=0xFFFE, T1L=0x0001
+																			// . T1C += T1L = 0xFFFF
+																			// . T1C +=   2 = 0x0001
+				if (pMB->sy6522.TIMER1_COUNTER.w > pMB->sy6522.TIMER1_LATCH.w)
+				{
+					if (pMB->sy6522.TIMER1_LATCH.w)
+						pMB->sy6522.TIMER1_COUNTER.w %= pMB->sy6522.TIMER1_LATCH.w;	// Only occurs if LATCH.w<0x0007 (# cycles for longest opcode)
+					else
+						pMB->sy6522.TIMER1_COUNTER.w = 0;
+				}
 				StartTimer1(pMB);
 			}
 		}
-		else if (pMB->bTimer2Active && bTimer2Underflow)
+
+		if (pMB->bLoadT1C)
+		{
+			pMB->bLoadT1C = false;
+			pMB->sy6522.TIMER1_COUNTER.w = pMB->sy6522.TIMER1_LATCH.w;
+		}
+
+		if (pMB->bTimer2Active && bTimer2Irq)
 		{
 			UpdateIFR(pMB, 0, IxR_TIMER2);
 
-			if((pMB->sy6522.ACR & RUNMODE) == RM_ONESHOT)
-			{
-				StopTimer2(pMB);
-			}
-			else
-			{
-				pMB->sy6522.TIMER2_COUNTER.w = pMB->sy6522.TIMER2_LATCH.w;
-				StartTimer2(pMB);
-			}
+			// TIMER2 only runs in one-shot mode
+			StopTimer2(pMB);
 		}
 	}
+
+	return bIrqOnLastOpcodeCycle;
 }
 
 //-----------------------------------------------------------------------------
-
-SS_CARDTYPE MB_GetSoundcardType()
-{
-	return g_SoundcardType;
-}
-
-void MB_SetSoundcardType(SS_CARDTYPE NewSoundcardType)
-{
-	if (g_SoundcardType == NewSoundcardType)
-		return;
-
-	g_SoundcardType = NewSoundcardType;
-
-	if(g_SoundcardType == CT_Empty)
-		MB_Mute();
-
-	g_bPhasorEnable = (g_SoundcardType == CT_Phasor);
-}
-
-//-----------------------------------------------------------------------------
-
-static double MB_GetFramePeriod(void)
-{
-	// TODO: Ideally remove this (slot-4) Phasor-IFR check: [*1]
-	// . It's for Phasor music player, which runs in one-shot mode:
-	// . MB_UpdateCycles()
-	//   -> Timer1 underflows & StopTimer1() is called, which sets g_nMBTimerDevice == kTIMERDEVICE_INVALID
-	// . MB_EndOfVideoFrame(), and g_nMBTimerDevice == kTIMERDEVICE_INVALID
-	//   -> MB_Update()
-	//      -> MB_GetFramePeriod()
-	// NB. Removing this Phasor-IFR check means the occasional 'g_f6522TimerPeriod_NoIRQ' gets returned.
-
-	if ((g_nMBTimerDevice != kTIMERDEVICE_INVALID) ||
-		(g_bPhasorEnable && (g_MB[0].sy6522.IFR & IxR_TIMER1)))	// [*1]
-	{
-		return (double)g_n6522TimerPeriod;
-	}
-	else
-	{
-		return g_f6522TimerPeriod_NoIRQ;
-	}
-}
 
 bool MB_IsActive()
 {
@@ -1871,58 +1965,14 @@ void MB_GetSnapshot_v1(SS_CARD_MOCKINGBOARD_v1* const pSS, const DWORD dwSlot)
 	}
 }
 
-int MB_SetSnapshot_v1(const SS_CARD_MOCKINGBOARD_v1* const pSS, const DWORD /*dwSlot*/)
-{
-	if(pSS->Hdr.UnitHdr.hdr.v1.dwVersion != MAKE_VERSION(1,0,0,0))
-		return -1;
-
-	UINT nMbCardNum = pSS->Hdr.Slot - SLOT4;
-	UINT nDeviceNum = nMbCardNum*2;
-	SY6522_AY8910* pMB = &g_MB[nDeviceNum];
-
-	g_nSSI263Device = 0;
-	g_nCurrentActivePhoneme = -1;
-
-	for(UINT i=0; i<MB_UNITS_PER_CARD_v1; i++)
-	{
-		memcpy(&pMB->sy6522, &pSS->Unit[i].RegsSY6522, sizeof(SY6522));
-		memcpy(AY8910_GetRegsPtr(nDeviceNum), &pSS->Unit[i].RegsAY8910, 16);
-		memcpy(&pMB->SpeechChip, &pSS->Unit[i].RegsSSI263, sizeof(SSI263A));
-		pMB->nAYCurrentRegister = pSS->Unit[i].nAYCurrentRegister;
-		pMB->state = AY_INACTIVE;
-
-		StartTimer1_LoadStateV1(pMB);	// Attempt to start timer
-
-		//
-
-		// Crude - currently only support a single speech chip
-		// FIX THIS:
-		// . Speech chip could be Votrax instead
-		// . Is this IRQ compatible with Phasor?
-		if(pMB->SpeechChip.DurationPhoneme)
-		{
-			g_nSSI263Device = nDeviceNum;
-
-			if((pMB->SpeechChip.CurrentMode != MODE_IRQ_DISABLED) && (pMB->sy6522.PCR == 0x0C) && (pMB->sy6522.IER & IxR_PERIPHERAL))
-			{
-				UpdateIFR(pMB, 0, IxR_PERIPHERAL);
-				pMB->SpeechChip.CurrentMode |= 1;	// Set SSI263's D7 pin
-			}
-		}
-
-		nDeviceNum++;
-		pMB++;
-	}
-
-	return 0;
-}
-
 //===========================================================================
 
 // Unit version history:
 // 2: Added: Timer1 & Timer2 active
-// 3: Added: Unit state
-const UINT kUNIT_VERSION = 3;
+// 3: Added: Unit state - GH#320
+// 4: Added: 6522 timerIrqDelay - GH#652
+// 5: Added: Unit state-B (Phasor only) - GH#659
+const UINT kUNIT_VERSION = 5;
 
 const UINT NUM_MB_UNITS = 2;
 const UINT NUM_PHASOR_UNITS = 2;
@@ -1951,11 +2001,14 @@ const UINT NUM_PHASOR_UNITS = 2;
 #define SS_YAML_KEY_SSI263_REG_CURRENT_MODE "Current Mode"
 #define SS_YAML_KEY_AY_CURR_REG "AY Current Register"
 #define SS_YAML_KEY_MB_UNIT_STATE "Unit State"
+#define SS_YAML_KEY_MB_UNIT_STATE_B "Unit State-B"	// Phasor only
 #define SS_YAML_KEY_TIMER1_IRQ "Timer1 IRQ Pending"
 #define SS_YAML_KEY_TIMER2_IRQ "Timer2 IRQ Pending"
 #define SS_YAML_KEY_SPEECH_IRQ "Speech IRQ Pending"
 #define SS_YAML_KEY_TIMER1_ACTIVE "Timer1 Active"
 #define SS_YAML_KEY_TIMER2_ACTIVE "Timer2 Active"
+#define SS_YAML_KEY_SY6522_TIMER1_IRQ_DELAY "Timer1 IRQ Delay"
+#define SS_YAML_KEY_SY6522_TIMER2_IRQ_DELAY "Timer2 IRQ Delay"
 
 #define SS_YAML_KEY_PHASOR_UNIT "Unit"
 #define SS_YAML_KEY_PHASOR_CLOCK_SCALE_FACTOR "Clock Scale Factor"
@@ -1983,8 +2036,10 @@ static void SaveSnapshotSY6522(YamlSaveHelper& yamlSaveHelper, SY6522& sy6522)
 	yamlSaveHelper.SaveHexUint8(SS_YAML_KEY_SY6522_REG_DDRA, sy6522.DDRA);
 	yamlSaveHelper.SaveHexUint16(SS_YAML_KEY_SY6522_REG_T1_COUNTER, sy6522.TIMER1_COUNTER.w);
 	yamlSaveHelper.SaveHexUint16(SS_YAML_KEY_SY6522_REG_T1_LATCH,   sy6522.TIMER1_LATCH.w);
+	yamlSaveHelper.SaveUint(SS_YAML_KEY_SY6522_TIMER1_IRQ_DELAY,    sy6522.timer1IrqDelay);	// v4
 	yamlSaveHelper.SaveHexUint16(SS_YAML_KEY_SY6522_REG_T2_COUNTER, sy6522.TIMER2_COUNTER.w);
 	yamlSaveHelper.SaveHexUint16(SS_YAML_KEY_SY6522_REG_T2_LATCH,   sy6522.TIMER2_LATCH.w);
+	yamlSaveHelper.SaveUint(SS_YAML_KEY_SY6522_TIMER2_IRQ_DELAY,    sy6522.timer2IrqDelay);	// v4
 	yamlSaveHelper.SaveHexUint8(SS_YAML_KEY_SY6522_REG_SERIAL_SHIFT, sy6522.SERIAL_SHIFT);
 	yamlSaveHelper.SaveHexUint8(SS_YAML_KEY_SY6522_REG_ACR, sy6522.ACR);
 	yamlSaveHelper.SaveHexUint8(SS_YAML_KEY_SY6522_REG_PCR, sy6522.PCR);
@@ -2036,7 +2091,7 @@ void MB_SaveSnapshot(YamlSaveHelper& yamlSaveHelper, const UINT uSlot)
 	}
 }
 
-static void LoadSnapshotSY6522(YamlLoadHelper& yamlLoadHelper, SY6522& sy6522)
+static void LoadSnapshotSY6522(YamlLoadHelper& yamlLoadHelper, SY6522& sy6522, UINT version)
 {
 	if (!yamlLoadHelper.GetSubMap(SS_YAML_KEY_SY6522))
 		throw std::string("Card: Expected key: ") + std::string(SS_YAML_KEY_SY6522);
@@ -2055,6 +2110,14 @@ static void LoadSnapshotSY6522(YamlLoadHelper& yamlLoadHelper, SY6522& sy6522)
 	sy6522.IFR  = yamlLoadHelper.LoadUint(SS_YAML_KEY_SY6522_REG_IFR);
 	sy6522.IER  = yamlLoadHelper.LoadUint(SS_YAML_KEY_SY6522_REG_IER);
 	sy6522.ORA_NO_HS = 0;	// Not saved
+
+	sy6522.timer1IrqDelay = sy6522.timer2IrqDelay = 0;
+
+	if (version >= 4)
+	{
+		sy6522.timer1IrqDelay = yamlLoadHelper.LoadUint(SS_YAML_KEY_SY6522_TIMER1_IRQ_DELAY);
+		sy6522.timer2IrqDelay = yamlLoadHelper.LoadUint(SS_YAML_KEY_SY6522_TIMER2_IRQ_DELAY);
+	}
 
 	yamlLoadHelper.PopMap();
 }
@@ -2098,7 +2161,8 @@ bool MB_LoadSnapshot(YamlLoadHelper& yamlLoadHelper, UINT slot, UINT version)
 		if (!yamlLoadHelper.GetSubMap(unit))
 			throw std::string("Card: Expected key: ") + std::string(unit);
 
-		LoadSnapshotSY6522(yamlLoadHelper, pMB->sy6522);
+		LoadSnapshotSY6522(yamlLoadHelper, pMB->sy6522, version);
+		UpdateIFR(pMB, 0, pMB->sy6522.IFR);					// Assert any pending IRQs (GH#677)
 		AY8910_LoadSnapshot(yamlLoadHelper, nDeviceNum, std::string(""));
 		LoadSnapshotSSI263(yamlLoadHelper, pMB->SpeechChip);
 
@@ -2114,6 +2178,7 @@ bool MB_LoadSnapshot(YamlLoadHelper& yamlLoadHelper, UINT slot, UINT version)
 		}
 
 		pMB->state = AY_INACTIVE;
+		pMB->stateB = AY_INACTIVE;
 		if (version >= 3)
 			pMB->state = (MockingboardUnitState_e) (yamlLoadHelper.LoadUint(SS_YAML_KEY_MB_UNIT_STATE) & 7);
 
@@ -2150,11 +2215,9 @@ bool MB_LoadSnapshot(YamlLoadHelper& yamlLoadHelper, UINT slot, UINT version)
 		pMB++;
 	}
 
-	AY8910_InitClock((int)CLK_6502);
+	AY8910_InitClock((int)Get6502BaseClock());
 
-	// Setup in MB_InitializeIO() -> MB_SetSoundcardType()
-	g_SoundcardType = CT_Empty;
-	g_bPhasorEnable = false;
+	// NB. g_SoundcardType & g_bPhasorEnable setup in MB_InitializeIO() -> MB_SetSoundcardType()
 
 	return true;
 }
@@ -2184,6 +2247,7 @@ void Phasor_SaveSnapshot(YamlSaveHelper& yamlSaveHelper, const UINT uSlot)
 		SaveSnapshotSSI263(yamlSaveHelper, pMB->SpeechChip);
 
 		yamlSaveHelper.SaveHexUint4(SS_YAML_KEY_MB_UNIT_STATE, pMB->state);
+		yamlSaveHelper.SaveHexUint4(SS_YAML_KEY_MB_UNIT_STATE_B, pMB->stateB);
 		yamlSaveHelper.SaveHexUint4(SS_YAML_KEY_AY_CURR_REG, pMB->nAYCurrentRegister);
 		yamlSaveHelper.Save("%s: %s # Not supported\n", SS_YAML_KEY_TIMER1_IRQ, "false");
 		yamlSaveHelper.Save("%s: %s # Not supported\n", SS_YAML_KEY_TIMER2_IRQ, "false");
@@ -2222,7 +2286,8 @@ bool Phasor_LoadSnapshot(YamlLoadHelper& yamlLoadHelper, UINT slot, UINT version
 		if (!yamlLoadHelper.GetSubMap(unit))
 			throw std::string("Card: Expected key: ") + std::string(unit);
 
-		LoadSnapshotSY6522(yamlLoadHelper, pMB->sy6522);
+		LoadSnapshotSY6522(yamlLoadHelper, pMB->sy6522, version);
+		UpdateIFR(pMB, 0, pMB->sy6522.IFR);					// Assert any pending IRQs (GH#677)
 		AY8910_LoadSnapshot(yamlLoadHelper, nDeviceNum+0, std::string("-A"));
 		AY8910_LoadSnapshot(yamlLoadHelper, nDeviceNum+1, std::string("-B"));
 		LoadSnapshotSSI263(yamlLoadHelper, pMB->SpeechChip);
@@ -2239,8 +2304,11 @@ bool Phasor_LoadSnapshot(YamlLoadHelper& yamlLoadHelper, UINT slot, UINT version
 		}
 
 		pMB->state = AY_INACTIVE;
+		pMB->stateB = AY_INACTIVE;
 		if (version >= 3)
 			pMB->state = (MockingboardUnitState_e) (yamlLoadHelper.LoadUint(SS_YAML_KEY_MB_UNIT_STATE) & 7);
+		if (version >= 5)
+			pMB->stateB = (MockingboardUnitState_e) (yamlLoadHelper.LoadUint(SS_YAML_KEY_MB_UNIT_STATE_B) & 7);
 
 		yamlLoadHelper.PopMap();
 
@@ -2275,11 +2343,9 @@ bool Phasor_LoadSnapshot(YamlLoadHelper& yamlLoadHelper, UINT slot, UINT version
 		pMB++;
 	}
 
-	AY8910_InitClock((int)(CLK_6502 * g_PhasorClockScaleFactor));
+	AY8910_InitClock((int)(Get6502BaseClock() * g_PhasorClockScaleFactor));
 
-	// Setup in MB_InitializeIO() -> MB_SetSoundcardType()
-	g_SoundcardType = CT_Empty;
-	g_bPhasorEnable = false;
+	// NB. g_SoundcardType & g_bPhasorEnable setup in MB_InitializeIO() -> MB_SetSoundcardType()
 
 	return true;
 }

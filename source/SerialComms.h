@@ -1,6 +1,6 @@
 #pragma once
 
-extern class CSuperSerialCard sg_SSC;
+#include "Card.h"
 
 enum {COMMEVT_WAIT=0, COMMEVT_ACK, COMMEVT_TERM, COMMEVT_MAX};
 enum eFWMODE {FWMODE_CIC=0, FWMODE_SIC_P8, FWMODE_PPC, FWMODE_SIC_P8A};	// NB. CIC = SSC
@@ -22,24 +22,26 @@ typedef struct
 #define TEXT_SERIAL_COM TEXT("COM")
 #define TEXT_SERIAL_TCP TEXT("TCP")
 
-class CSuperSerialCard
+class CSuperSerialCard : public Card
 {
 public:
 	CSuperSerialCard();
 	virtual ~CSuperSerialCard();
 
+	virtual void Init(void) {};
+	virtual void Reset(const bool powerCycle) {};
+
 	void	CommInitialize(LPBYTE pCxRomPeripheral, UINT uSlot);
 	void    CommReset();
 	void    CommDestroy();
 	void    CommSetSerialPort(HWND hWindow, DWORD dwNewSerialPortItem);
-	void    SetSnapshot_v1(const DWORD baudrate, const BYTE bytesize, const BYTE commandbyte, const DWORD comminactivity, const BYTE controlbyte, const BYTE parity, const BYTE stopbits);
-	std::string GetSnapshotCardName(void);
+	static std::string GetSnapshotCardName(void);
 	void	SaveSnapshot(class YamlSaveHelper& yamlSaveHelper);
 	bool	LoadSnapshot(class YamlLoadHelper& yamlLoadHelper, UINT slot, UINT version);
 
 	char*	GetSerialPortChoices();
 	DWORD	GetSerialPort() { return m_dwSerialPortItem; }	// Drop-down list item
-	char*	GetSerialPortName() { return m_ayCurrentSerialPortName; }
+	const std::string &	GetSerialPortName() { return m_ayCurrentSerialPortName; }
 	void	SetSerialPortName(const char* pSerialPortName);
 	bool	IsActive() { return (m_hCommHandle != INVALID_HANDLE_VALUE) || (m_hCommListenSocket != INVALID_SOCKET); }
 	void	SupportDCD(bool bEnable) { m_bCfgSupportDCD = bEnable; }	// Status
@@ -84,10 +86,10 @@ private:
 	//
 
 public:
-	static const UINT SIZEOF_SERIALCHOICE_ITEM = 8*sizeof(char);
+	static const UINT SIZEOF_SERIALCHOICE_ITEM = 12*sizeof(char);
 
 private:
-	char	m_ayCurrentSerialPortName[SIZEOF_SERIALCHOICE_ITEM];
+	std::string m_ayCurrentSerialPortName;
 	DWORD	m_dwSerialPortItem;
 
 	static const UINT SERIALPORTITEM_INVALID_COM_PORT = 0;
@@ -116,7 +118,7 @@ private:
 
 	//
 
-	CRITICAL_SECTION	m_CriticalSection;	// To guard /g_vRecvBytes/
+	CRITICAL_SECTION	m_CriticalSection;	// To guard /m_vuRxCurrBuffer/ and /m_vbTxEmpty/
 	std::deque<BYTE>	m_qComSerialBuffer[2];
 	volatile UINT		m_vuRxCurrBuffer;	// Written to on COM recv. SSC reads from other one
 	std::deque<BYTE>	m_qTcpSerialBuffer;

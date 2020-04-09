@@ -70,7 +70,7 @@
 				WarningLevel="3"
 				SuppressStartupBanner="true"
 				DebugInformationFormat="3"
-				DisableSpecificWarnings="4819;4996"
+				DisableSpecificWarnings="4819;4995;4996"
 			/>
 			<Tool
 				Name="VCManagedResourceCompilerTool"
@@ -169,7 +169,7 @@
 				WarningLevel="3"
 				SuppressStartupBanner="true"
 				DebugInformationFormat="4"
-				DisableSpecificWarnings="4819;4996"
+				DisableSpecificWarnings="4819;4995;4996"
 			/>
 			<Tool
 				Name="VCManagedResourceCompilerTool"
@@ -610,6 +610,18 @@
 					>
 				</File>
 				<File
+					RelativePath=".\source\Card.h"
+					>
+				</File>
+				<File
+					RelativePath=".\source\CardManager.cpp"
+					>
+				</File>
+				<File
+					RelativePath=".\source\CardManager.h"
+					>
+				</File>
+				<File
 					RelativePath=".\source\Joystick.cpp"
 					>
 				</File>
@@ -623,6 +635,14 @@
 				</File>
 				<File
 					RelativePath=".\source\Keyboard.h"
+					>
+				</File>
+				<File
+					RelativePath=".\source\LanguageCard.cpp"
+					>
+				</File>
+				<File
+					RelativePath=".\source\LanguageCard.h"
 					>
 				</File>
 				<File
@@ -830,6 +850,14 @@
 					>
 				</File>
 				<File
+					RelativePath=".\source\Disk2CardManager.cpp"
+					>
+				</File>
+				<File
+					RelativePath=".\source\Disk2CardManager.h"
+					>
+				</File>
+				<File
 					RelativePath=".\source\DiskDefs.h"
 					>
 				</File>
@@ -895,6 +923,14 @@
 				</File>
 				<File
 					RelativePath=".\source\NTSC_CharSet.h"
+					>
+				</File>
+				<File
+					RelativePath=".\source\RGBMonitor.cpp"
+					>
+				</File>
+				<File
+					RelativePath=".\source\RGBMonitor.h"
 					>
 				</File>
 				<File
@@ -1056,6 +1092,14 @@
 				>
 			</File>
 			<File
+				RelativePath=".\resource\Apple2_JPlus.rom"
+				>
+			</File>
+			<File
+				RelativePath=".\resource\Apple2_JPlus_Video.rom"
+				>
+			</File>
+			<File
 				RelativePath=".\resource\Apple2e.rom"
 				>
 			</File>
@@ -1143,6 +1187,10 @@
 			</File>
 			<File
 				RelativePath=".\resource\Disk2.rom"
+				>
+			</File>
+			<File
+				RelativePath=".\resource\Disk2-13sector.rom"
 				>
 			</File>
 			<File
@@ -1275,6 +1323,10 @@
 			</File>
 			<File
 				RelativePath=".\resource\TKClock.rom"
+				>
+			</File>
+			<File
+				RelativePath=".\resource\version.h"
 				>
 			</File>
 			<File

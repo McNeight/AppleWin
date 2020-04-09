@@ -42,7 +42,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 // Addressing _____________________________________________________________________________________
 
 	AddressingMode_t g_aOpmodes[ NUM_ADDRESSING_MODES ] =
-	{ // Outut, but eventually used for Input when Assembler is working.
+	{ // Output, but eventually used for Input when Assembler is working.
 		{TEXT("")        , 1 , "(implied)"              }, // (implied)
         {TEXT("")        , 1 , "n/a 1"         }, // INVALID1
         {TEXT("")        , 2 , "n/a 2"         }, // INVALID2
@@ -112,7 +112,7 @@ const Opcodes_t g_aOpcodes65C02[ NUM_OPCODES ] =
 	{"SEC", 0     ,  0}, {"AND", AM_AY , R_}, {"DEC", 0     ,  0}, {"nop", 0  , 0 }, // 38 .. 3B
 	{"BIT", AM_AX , R_}, {"AND", AM_AX , R_}, {"ROL", AM_AX , RW}, {"nop", 0  , 0 }, // 3C .. 3F
 
-	{"RTI", 0     ,  0}, {"EOR", AM_IZX, R_}, {"nop", AM_M  , im}, {"nop", 0  , 0 }, // 40 .. 43
+	{"RTI", 0     , SR}, {"EOR", AM_IZX, R_}, {"nop", AM_M  , im}, {"nop", 0  , 0 }, // 40 .. 43
 	{"nop", AM_Z  ,  0}, {"EOR", AM_Z  , R_}, {"LSR", AM_Z  , _W}, {"nop", 0  , 0 }, // 44 .. 47
 	{"PHA", 0     , SW}, {"EOR", AM_M  , im}, {"LSR", 0     ,  0}, {"nop", 0  , 0 }, // 48 .. 4B
 	{"JMP", AM_A  ,  0}, {"EOR", AM_A  , R_}, {"LSR", AM_A  , _W}, {"nop", 0  , 0 }, // 4C .. 4F
@@ -124,11 +124,11 @@ const Opcodes_t g_aOpcodes65C02[ NUM_OPCODES ] =
 	{"RTS", 0     , SR}, {"ADC", AM_IZX, R_}, {"nop", AM_M  , im}, {"nop", 0  , 0 }, // 60 .. 63
 	{"STZ", AM_Z  , _W}, {"ADC", AM_Z  , R_}, {"ROR", AM_Z  , RW}, {"nop", 0  , 0 }, // 64 .. 67
 	{"PLA", 0     , SR}, {"ADC", AM_M  , im}, {"ROR", 0     ,  0}, {"nop", 0  , 0 }, // 68 .. 6B
-	{"JMP", AM_NA ,  0}, {"ADC", AM_A  , R_}, {"ROR", AM_A  , RW}, {"nop", 0  , 0 }, // 6C .. 6F
+	{"JMP", AM_NA , R_}, {"ADC", AM_A  , R_}, {"ROR", AM_A  , RW}, {"nop", 0  , 0 }, // 6C .. 6F
 	{"BVS", AM_R  ,  0}, {"ADC", AM_NZY, R_}, {"ADC", AM_NZ , R_}, {"nop", 0  , 0 }, // 70 .. 73
 	{"STZ", AM_ZX , _W}, {"ADC", AM_ZX , R_}, {"ROR", AM_ZX , RW}, {"nop", 0  , 0 }, // 74 .. 77
 	{"SEI", 0     ,  0}, {"ADC", AM_AY , R_}, {"PLY", 0     , SR}, {"nop", 0  , 0 }, // 78 .. 7B
-	{"JMP", AM_IAX,  0}, {"ADC", AM_AX , R_}, {"ROR", AM_AX , RW}, {"nop", 0  , 0 }, // 7C .. 7F
+	{"JMP", AM_IAX, R_}, {"ADC", AM_AX , R_}, {"ROR", AM_AX , RW}, {"nop", 0  , 0 }, // 7C .. 7F
 
 	{"BRA", AM_R  ,  0}, {"STA", AM_IZX, _W}, {"nop", AM_M  , im}, {"nop", 0  , 0 }, // 80 .. 83
 	{"STY", AM_Z  , _W}, {"STA", AM_Z  , _W}, {"STX", AM_Z  , _W}, {"nop", 0  , 0 }, // 84 .. 87
@@ -234,7 +234,7 @@ Fx	BEQ r  SBC (d),Y  sbc (z)  ---  ---      SBC d,X  INC z,X  ---  SED  SBC a,Y 
 	{"SEC", 0     ,  0}, {"AND", AM_AY , R_}, {"nop", 0     ,  0}, {"rla", AM_AY , RW}, // 38 .. 3B
 	{"nop", AM_AX ,  0}, {"AND", AM_AX , R_}, {"ROL", AM_AX , RW}, {"rla", AM_AX , RW}, // 3C .. 3F
 
-	{"RTI", 0     ,  0}, {"EOR", AM_IZX, R_}, {"hlt", 0     ,  0}, {"lse", AM_IZX, RW}, // 40 .. 43
+	{"RTI", 0     , SR}, {"EOR", AM_IZX, R_}, {"hlt", 0     ,  0}, {"lse", AM_IZX, RW}, // 40 .. 43
 	{"nop", AM_Z  ,  0}, {"EOR", AM_Z  , R_}, {"LSR", AM_Z  , RW}, {"lse", AM_Z  , RW}, // 44 .. 47
 	{"PHA", 0     , SW}, {"EOR", AM_M  , im}, {"LSR", 0     ,  0}, {"alr", AM_M  , im}, // 48 .. 4B
 	{"JMP", AM_A  ,  0}, {"EOR", AM_A  , R_}, {"LSR", AM_A  , RW}, {"lse", AM_A  , RW}, // 4C .. 4F
@@ -246,7 +246,7 @@ Fx	BEQ r  SBC (d),Y  sbc (z)  ---  ---      SBC d,X  INC z,X  ---  SED  SBC a,Y 
 	{"RTS", 0     , SR}, {"ADC", AM_IZX, R_}, {"hlt", 0     ,  0}, {"rra", AM_IZX, RW}, // 60 .. 63
 	{"nop", AM_Z  ,  0}, {"ADC", AM_Z  , R_}, {"ROR", AM_Z  , RW}, {"rra", AM_Z  , RW}, // 64 .. 67
 	{"PLA", 0     , SR}, {"ADC", AM_M  , im}, {"ROR", 0     ,  0}, {"arr", AM_M  , im}, // 68 .. 6B
-	{"JMP", AM_NA ,  0}, {"ADC", AM_A  , R_}, {"ROR", AM_A  , RW}, {"rra", AM_A  , RW}, // 6C .. 6F
+	{"JMP", AM_NA , R_}, {"ADC", AM_A  , R_}, {"ROR", AM_A  , RW}, {"rra", AM_A  , RW}, // 6C .. 6F
 	{"BVS", AM_R  ,  0}, {"ADC", AM_NZY, R_}, {"hlt", 0     ,  0}, {"rra", AM_NZY, RW}, // 70 .. 73
 	{"nop", AM_ZX ,  0}, {"ADC", AM_ZX , R_}, {"ROR", AM_ZX , RW}, {"rra", AM_ZX , RW}, // 74 .. 77
 	{"SEI", 0     ,  0}, {"ADC", AM_AY , R_}, {"nop", 0     ,  0}, {"rra", AM_AY , RW}, // 78 .. 7B
@@ -583,21 +583,20 @@ bool _6502_GetStackReturnAddress ( WORD & nAddress_ )
 
 
 //===========================================================================
-bool _6502_GetTargets ( WORD nAddress, int *pTargetPartial_, int *pTargetPartial2_, int *pTargetPointer_, int * pTargetBytes_, bool bIgnoreJSRJMP, bool bIgnoreBranch )
+bool _6502_GetTargets ( WORD nAddress, int *pTargetPartial_, int *pTargetPartial2_, int *pTargetPointer_, int * pTargetBytes_,
+						bool bIgnoreBranch /*= true*/, bool bIncludeNextOpcodeAddress /*= true*/ )
 {
-	bool bStatus = false;
-
 	if (! pTargetPartial_)
-		return bStatus;
+		return false;
 
 	if (! pTargetPartial2_)
-		return bStatus;
+		return false;
 
 	if (! pTargetPointer_)
-		return bStatus;
+		return false;
 
 //	if (! pTargetBytes_)
-//		return bStatus;
+//		return false;
 
 	*pTargetPartial_  = NO_6502_TARGET;
 	*pTargetPartial2_ = NO_6502_TARGET;
@@ -605,8 +604,6 @@ bool _6502_GetTargets ( WORD nAddress, int *pTargetPartial_, int *pTargetPartial
 
 	if (pTargetBytes_)
 		*pTargetBytes_  = 0;	
-
-	bStatus   = true;
 
 	BYTE nOpcode   = mem[nAddress];
 	BYTE nTarget8  = mem[(nAddress+1)&0xFFFF];
@@ -656,29 +653,35 @@ bool _6502_GetTargets ( WORD nAddress, int *pTargetPartial_, int *pTargetPartial
 						nTarget16 = _6502_STACK_BEGIN + ((regs.sp+1) & 0xFF);
 				}
 
-				*pTargetPointer_ = nTarget16;
+				if (bIncludeNextOpcodeAddress || (nOpcode != OPCODE_RTI && nOpcode != OPCODE_RTS && nOpcode != OPCODE_BRK))
+					*pTargetPointer_ = nTarget16;
 
 				if (pTargetBytes_)
 					*pTargetBytes_ = 1;
 			}
 			break;
 
-		case AM_A: // $Absolute
-			if (nOpcode == OPCODE_JSR)	// JSR?
+		case AM_A: // Absolute
+			if (nOpcode == OPCODE_JSR)
 			{
 				*pTargetPartial_  = _6502_STACK_BEGIN + ((regs.sp+0) & 0xFF);
 				*pTargetPartial2_ = _6502_STACK_BEGIN + ((regs.sp-1) & 0xFF);
 			}
 
-			*pTargetPointer_ = nTarget16;
+			if (bIncludeNextOpcodeAddress || (nOpcode != OPCODE_JSR && nOpcode != OPCODE_JMP_A))
+				*pTargetPointer_ = nTarget16;
+
 			if (pTargetBytes_)
 				*pTargetBytes_ = 2;
 			break;
 
-		case AM_IAX: // Indexed (Absolute) Indirect
+		case AM_IAX: // Indexed (Absolute) Indirect - ie. JMP (abs,x)
+			_ASSERT(nOpcode == OPCODE_JMP_IAX);
 			nTarget16 += regs.x;
 			*pTargetPartial_    = nTarget16;
-			*pTargetPointer_    = *(LPWORD)(mem + nTarget16);
+			*pTargetPartial2_   = nTarget16+1;
+			if (bIncludeNextOpcodeAddress)
+				*pTargetPointer_ = *(LPWORD)(mem + nTarget16);
 			if (pTargetBytes_)
 				*pTargetBytes_ = 2;
 			break;
@@ -697,9 +700,12 @@ bool _6502_GetTargets ( WORD nAddress, int *pTargetPartial_, int *pTargetPartial
 				*pTargetBytes_ = 2;
 			break;
 
-		case AM_NA: // Indirect (Absolute) i.e. JMP
+		case AM_NA: // Indirect (Absolute) - ie. JMP (abs)
+			_ASSERT(nOpcode == OPCODE_JMP_NA);
 			*pTargetPartial_    = nTarget16;
-			*pTargetPointer_    = *(LPWORD)(mem + nTarget16);
+			*pTargetPartial2_   = nTarget16+1;
+			if (bIncludeNextOpcodeAddress)
+				*pTargetPointer_ = *(LPWORD)(mem + nTarget16);
 			if (pTargetBytes_)
 				*pTargetBytes_ = 2;
 			break;
@@ -727,7 +733,7 @@ bool _6502_GetTargets ( WORD nAddress, int *pTargetPartial_, int *pTargetPartial
 			break;
 
 		case AM_R:
-			if (! bIgnoreBranch)
+			if (!bIgnoreBranch)
 			{
 				*pTargetPartial_  = nTarget8;
 				*pTargetPointer_ = nAddress + 2;
@@ -768,22 +774,7 @@ bool _6502_GetTargets ( WORD nAddress, int *pTargetPartial_, int *pTargetPartial
 			break;
 	}
 
-	if (bIgnoreJSRJMP)
-	{	
-		// If 6502 is jumping, don't show byte [nAddressTarget]
-		if ((*pTargetPointer_ >= 0) && (
-			(nOpcode == OPCODE_JSR    ) || // 0x20
-			(nOpcode == OPCODE_JMP_A  )))  // 0x4C
-//			(nOpcode == OPCODE_JMP_NA ) || // 0x6C
-//			(nOpcode == OPCODE_JMP_IAX)))  // 0x7C
-		{
-			*pTargetPointer_ = NO_6502_TARGET;
-			if (pTargetBytes_)
-				*pTargetBytes_ = 0;
-		}
-	}
-	
-	return bStatus;
+	return true;
 }
 
 
@@ -808,7 +799,7 @@ bool _6502_GetTargetAddress ( const WORD & nAddress, WORD & nTarget_ )
 		int nTargetPointer;
 		WORD nTargetValue = 0; // de-ref
 		int nTargetBytes;
-		_6502_GetTargets( nAddress, &nTargetPartial, &nTargetPointer, &nTargetBytes, false, false );
+		_6502_GetTargets( nAddress, &nTargetPartial, &nTargetPointer, &nTargetBytes, false );
 
 //		if (nTargetPointer == NO_6502_TARGET)
 //		{

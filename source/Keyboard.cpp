@@ -39,7 +39,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 static BYTE asciicode[2][10] = {
 	// VK_LEFT/UP/RIGHT/DOWN/SELECT, VK_PRINT/EXECUTE/SNAPSHOT/INSERT/DELETE
-	{0x08,0x0D,0x15,0x2F,0x00, 0x00,0x00,0x00,0x00,0x00},	// Apple II
+	{0x08,0x00,0x15,0x00,0x00, 0x00,0x00,0x00,0x00,0x00},	// Apple II
 	{0x08,0x0B,0x15,0x0A,0x00, 0x00,0x00,0x00,0x00,0x7F}	// Apple //e
 };	// Convert PC arrow keys to Apple keycodes
 
@@ -53,15 +53,22 @@ static bool  g_bCapsLock = true; //Caps lock key for Apple2 and Lat/Cyr lock for
 static bool  g_bP8CapsLock = true; //Caps lock key of Pravets 8A/C
 static BYTE  keycode         = 0;	// Current Apple keycode
 static BOOL  keywaiting      = 0;
+static bool  g_bAltGrSendsWM_CHAR = false;
 
 //
 // ----- ALL GLOBALLY ACCESSIBLE FUNCTIONS ARE BELOW THIS LINE -----
 //
 
+void KeybSetAltGrSendsWM_CHAR(bool state)
+{
+	g_bAltGrSendsWM_CHAR = state;
+}
+
 //===========================================================================
 
 void KeybReset()
 {
+	keycode = 0;
 	keywaiting = 0;
 }
 
@@ -195,7 +202,7 @@ void KeybQueueKeypress (WPARAM key, Keystroke_e bASCII)
 					if (key == 92) keycode = 96;
 					if (GetCapsLockAllowed() == true)
 					{
-						if ((key == 92) || (key == 124)) keycode = 96; //Ý to Þ
+						if ((key == 92) || (key == 124)) keycode = 96; //Ã to Ãž
 						//This shall be rewriten, so that enabling CAPS_LOCK (i.e. F10) will not invert these keys values)
 						//The same for latin letters.
 						if ((key == '{') || (key == '}') || (key == '~') || (key == 124) || (key == '^') ||  (key == 95))
@@ -231,24 +238,24 @@ void KeybQueueKeypress (WPARAM key, Keystroke_e bASCII)
 				}
 			}
 			// Remap for the TK3000 //e, which had a special |Mode| key for displaying accented chars on screen
-			// Borrowed from Fábio Belavenuto's TK3000e emulator (Copyright (C) 2004) - http://code.google.com/p/tk3000e/
+			// Borrowed from FÃ¡bio Belavenuto's TK3000e emulator (Copyright (C) 2004) - http://code.google.com/p/tk3000e/
 			if (g_bTK3KModeKey)	// We already switch this on only if the the TK3000 is currently being emulated
 			{
 				if ((key >= 0xC0) && (key <= 0xDA)) key += 0x20; // Convert uppercase to lowercase
 				switch (key)
 				{
-					case 0xE0: key = '_';  break; // à
-					case 0xE1: key = '@';  break; // á
-					case 0xE2: key = '\\'; break; // â
-					case 0xE3: key = '[';  break; // ã
-					case 0xE7: key = ']';  break; // ç
-					case 0xE9: key = '`';  break; // é
-					case 0xEA: key = '&';  break; // ê
-					case 0xED: key = '{';  break; // í
-					case 0xF3: key = '~';  break; // ó
-					case 0xF4: key = '}';  break; // ô
-					case 0xF5: key = '#';  break; // õ
-					case 0xFA: key = '|';  break; // ú
+					case 0xE0: key = '_';  break; // Ã 
+					case 0xE1: key = '@';  break; // Ã¡
+					case 0xE2: key = '\\'; break; // Ã¢
+					case 0xE3: key = '[';  break; // Ã£
+					case 0xE7: key = ']';  break; // Ã§
+					case 0xE9: key = '`';  break; // Ã©
+					case 0xEA: key = '&';  break; // Ãª
+					case 0xED: key = '{';  break; // Ã­
+					case 0xF3: key = '~';  break; // Ã³
+					case 0xF4: key = '}';  break; // Ã´
+					case 0xF5: key = '#';  break; // Ãµ
+					case 0xFA: key = '|';  break; // Ãº
 				}
 				if (key > 0x7F) return;	// Get out
 				if ((key >= 'a') && (key <= 'z') && (g_bCapsLock))
@@ -306,7 +313,7 @@ void KeybQueueKeypress (WPARAM key, Keystroke_e bASCII)
 				return;
 			keycode = n;
 		}
-		else if ((GetKeyState(VK_RMENU) < 0))	// Right Alt (aka Alt Gr) - GH#558
+		else if (g_bAltGrSendsWM_CHAR && (GetKeyState(VK_RMENU) < 0))	// Right Alt (aka Alt Gr) - GH#558, GH#625
 		{
 			if (IsVirtualKeyAnAppleIIKey(key))
 			{
@@ -544,14 +551,8 @@ void KeybToggleP8ACapsLock ()
 
 //===========================================================================
 
-void KeybSetSnapshot_v1(const BYTE LastKey)
-{
-	keycode = LastKey;
-}
-
-//
-
 #define SS_YAML_KEY_LASTKEY "Last Key"
+#define SS_YAML_KEY_KEYWAITING "Key Waiting"
 
 static std::string KeybGetSnapshotStructName(void)
 {
@@ -563,14 +564,18 @@ void KeybSaveSnapshot(YamlSaveHelper& yamlSaveHelper)
 {
 	YamlSaveHelper::Label state(yamlSaveHelper, "%s:\n", KeybGetSnapshotStructName().c_str());
 	yamlSaveHelper.SaveHexUint8(SS_YAML_KEY_LASTKEY, keycode);
+	yamlSaveHelper.SaveBool(SS_YAML_KEY_KEYWAITING, keywaiting ? true : false);
 }
 
-void KeybLoadSnapshot(YamlLoadHelper& yamlLoadHelper)
+void KeybLoadSnapshot(YamlLoadHelper& yamlLoadHelper, UINT version)
 {
 	if (!yamlLoadHelper.GetSubMap(KeybGetSnapshotStructName()))
 		return;
 
 	keycode = (BYTE) yamlLoadHelper.LoadUint(SS_YAML_KEY_LASTKEY);
+
+	if (version >= 2)
+		keywaiting = (BOOL) yamlLoadHelper.LoadBool(SS_YAML_KEY_KEYWAITING);
 
 	yamlLoadHelper.PopMap();
 }

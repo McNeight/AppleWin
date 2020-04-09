@@ -87,6 +87,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #include "StdAfx.h"
 
 #include "Applewin.h"
+#include "CardManager.h"
 #include "CPU.h"
 #include "Frame.h"
 #include "Memory.h"
@@ -130,12 +131,7 @@ regsrec regs;
 unsigned __int64 g_nCumulativeCycles = 0;
 
 static ULONG g_nCyclesExecuted;	// # of cycles executed up to last IO access
-
 //static signed long g_uInternalExecutedCycles;
-// TODO: Use IRQ_CHECK_TIMEOUT=128 when running at full-speed else with IRQ_CHECK_TIMEOUT=1
-// - What about when running benchmark?
-static const int IRQ_CHECK_TIMEOUT = 128;
-static signed int g_nIrqCheckTimeout = IRQ_CHECK_TIMEOUT;
 
 //
 
@@ -147,6 +143,10 @@ static CRITICAL_SECTION g_CriticalSection;	// To guard /g_bmIRQ/ & /g_bmNMI/
 static volatile UINT32 g_bmIRQ = 0;
 static volatile UINT32 g_bmNMI = 0;
 static volatile BOOL g_bNmiFlank = FALSE; // Positive going flank on NMI line
+
+static bool g_irqDefer1Opcode = false;
+
+static bool g_isMouseCardInstalled = false;
 
 //
 
@@ -191,6 +191,21 @@ eCpuType GetActiveCpu(void)
 void SetActiveCpu(eCpuType cpu)
 {
 	g_ActiveCPU = cpu;
+}
+
+bool Is6502InterruptEnabled(void)
+{
+	return !(regs.ps & AF_INTERRUPT);
+}
+
+void ResetCyclesExecutedForDebugger(void)
+{
+	g_nCyclesExecuted = 0;
+}
+
+void SetMouseCardInstalled(bool installed)
+{
+	g_isMouseCardInstalled = installed;
 }
 
 //
@@ -398,10 +413,23 @@ static __forceinline void NMI(ULONG& uExecutedCycles, BOOL& flagc, BOOL& flagn, 
 #endif
 }
 
+// NB. No need to save to save-state, as IRQ() follows CheckInterruptSources(), and IRQ() always sets it to false.
+static bool g_irqOnLastOpcodeCycle = false;
+
 static __forceinline void IRQ(ULONG& uExecutedCycles, BOOL& flagc, BOOL& flagn, BOOL& flagv, BOOL& flagz)
 {
 	if(g_bmIRQ && !(regs.ps & AF_INTERRUPT))
 	{
+		// if 6522 interrupt occurs on opcode's last cycle, then defer IRQ by 1 opcode
+		if (g_irqOnLastOpcodeCycle && !g_irqDefer1Opcode)
+		{
+			g_irqOnLastOpcodeCycle = false;
+			g_irqDefer1Opcode = true;	// if INT occurs again on next opcode, then do NOT defer
+			return;
+		}
+
+		g_irqDefer1Opcode = false;
+
 		// IRQ signals are deasserted when a specific r/w operation is done on device
 #ifdef _DEBUG
 		g_nCycleIrqStart = g_nCumulativeCycles + uExecutedCycles;
@@ -415,16 +443,36 @@ static __forceinline void IRQ(ULONG& uExecutedCycles, BOOL& flagc, BOOL& flagn, 
 		UINT uExtraCycles = 0;	// Needed for CYC(a) macro
 		CYC(7)
 	}
+
+	g_irqOnLastOpcodeCycle = false;
 }
 
-static __forceinline void CheckInterruptSources(ULONG uExecutedCycles)
+const int IRQ_CHECK_OPCODE_FULL_SPEED = 40;	// ~128 cycles (assume 3 cycles per opcode)
+static int g_fullSpeedOpcodeCount = IRQ_CHECK_OPCODE_FULL_SPEED;
+
+static __forceinline void CheckInterruptSources(ULONG uExecutedCycles, const bool bVideoUpdate)
 {
-	if (g_nIrqCheckTimeout < 0)
+	if (!bVideoUpdate)
 	{
-		MB_UpdateCycles(uExecutedCycles);
-		sg_Mouse.SetVBlank( !VideoGetVblBar(uExecutedCycles) );
-		g_nIrqCheckTimeout = IRQ_CHECK_TIMEOUT;
+		g_fullSpeedOpcodeCount--;
+		if (g_fullSpeedOpcodeCount >= 0)
+			return;
+		g_fullSpeedOpcodeCount = IRQ_CHECK_OPCODE_FULL_SPEED;
 	}
+
+	if (MB_UpdateCycles(uExecutedCycles))
+		g_irqOnLastOpcodeCycle = true;
+
+	if (g_isMouseCardInstalled)
+		g_CardMgr.GetMouseCard()->SetVBlank( !VideoGetVblBar(uExecutedCycles) );
+}
+
+// GH#608: IRQ needs to occur within 17 cycles (6 opcodes) of configuring the timer interrupt
+void CpuAdjustIrqCheck(UINT uCyclesUntilInterrupt)
+{
+	const UINT opcodesUntilInterrupt = uCyclesUntilInterrupt/3;	// assume 3 cycles per opcode
+	if (g_bFullSpeed && opcodesUntilInterrupt < IRQ_CHECK_OPCODE_FULL_SPEED)
+		g_fullSpeedOpcodeCount = opcodesUntilInterrupt;
 }
 
 //===========================================================================
@@ -508,17 +556,18 @@ DWORD CpuExecute(const DWORD uCycles, const bool bVideoUpdate)
 {
 	g_nCyclesExecuted =	0;
 
-	MB_StartOfCpuExecute();
+#ifdef _DEBUG
+	MB_CheckCumulativeCycles();
+#endif
 
 	// uCycles:
 	//  =0  : Do single step
 	//  >0  : Do multi-opcode emulation
 	const DWORD uExecutedCycles = InternalCpuExecute(uCycles, bVideoUpdate);
 
+	// NB. Required for normal-speed (even though 6522 is updated after every opcode), as may've finished on IRQ()
 	MB_UpdateCycles(uExecutedCycles);	// Update 6522s (NB. Do this before updating g_nCumulativeCycles below)
 										// NB. Ensures that 6522 regs are up-to-date for any potential save-state
-
-	//
 
 	const UINT nRemainingCycles = uExecutedCycles - g_nCyclesExecuted;
 	g_nCumulativeCycles	+= nRemainingCycles;
@@ -644,27 +693,13 @@ void CpuReset()
 
 	regs.bJammed = 0;
 
+	g_irqDefer1Opcode = false;
+
 	SetActiveCpu( GetMainCpu() );
 	z80_reset();
 }
 
 //===========================================================================
-
-void CpuSetSnapshot_v1(const BYTE A, const BYTE X, const BYTE Y, const BYTE P, const BYTE SP, const USHORT PC, const unsigned __int64 CumulativeCycles)
-{
-	regs.a  = A;
-	regs.x  = X;
-	regs.y  = Y;
-	regs.ps = P | (AF_RESERVED | AF_BREAK);
-	regs.sp = ((USHORT)SP) | 0x100;
-	regs.pc = PC;
-
-	CpuIrqReset();
-	CpuNmiReset();
-	g_nCumulativeCycles = CumulativeCycles;
-}
-
-//
 
 #define SS_YAML_KEY_CPU_TYPE "Type"
 #define SS_YAML_KEY_REGA "A"
@@ -673,7 +708,8 @@ void CpuSetSnapshot_v1(const BYTE A, const BYTE X, const BYTE Y, const BYTE P, c
 #define SS_YAML_KEY_REGP "P"
 #define SS_YAML_KEY_REGS "S"
 #define SS_YAML_KEY_REGPC "PC"
-#define SS_YAML_KEY_CUMULATIVECYCLES "Cumulative Cycles"
+#define SS_YAML_KEY_CUMULATIVE_CYCLES "Cumulative Cycles"
+#define SS_YAML_KEY_IRQ_DEFER_1_OPCODE "Defer IRQ By 1 Opcode"
 
 #define SS_YAML_VALUE_6502 "6502"
 #define SS_YAML_VALUE_65C02 "65C02"
@@ -696,10 +732,11 @@ void CpuSaveSnapshot(YamlSaveHelper& yamlSaveHelper)
 	yamlSaveHelper.SaveHexUint8(SS_YAML_KEY_REGP, regs.ps);
 	yamlSaveHelper.SaveHexUint8(SS_YAML_KEY_REGS, (BYTE) regs.sp);
 	yamlSaveHelper.SaveHexUint16(SS_YAML_KEY_REGPC, regs.pc);
-	yamlSaveHelper.SaveHexUint64(SS_YAML_KEY_CUMULATIVECYCLES, g_nCumulativeCycles);
+	yamlSaveHelper.SaveHexUint64(SS_YAML_KEY_CUMULATIVE_CYCLES, g_nCumulativeCycles);
+	yamlSaveHelper.SaveBool(SS_YAML_KEY_IRQ_DEFER_1_OPCODE, g_irqDefer1Opcode);
 }
 
-void CpuLoadSnapshot(YamlLoadHelper& yamlLoadHelper)
+void CpuLoadSnapshot(YamlLoadHelper& yamlLoadHelper, UINT version)
 {
 	if (!yamlLoadHelper.GetSubMap(CpuGetSnapshotStructName()))
 		return;
@@ -720,7 +757,10 @@ void CpuLoadSnapshot(YamlLoadHelper& yamlLoadHelper)
 
 	CpuIrqReset();
 	CpuNmiReset();
-	g_nCumulativeCycles = yamlLoadHelper.LoadUint64(SS_YAML_KEY_CUMULATIVECYCLES);
+	g_nCumulativeCycles = yamlLoadHelper.LoadUint64(SS_YAML_KEY_CUMULATIVE_CYCLES);
+
+	if (version >= 5)
+		g_irqDefer1Opcode = yamlLoadHelper.LoadBool(SS_YAML_KEY_IRQ_DEFER_1_OPCODE);
 
 	yamlLoadHelper.PopMap();
 }
